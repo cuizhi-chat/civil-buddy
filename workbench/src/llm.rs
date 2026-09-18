@@ -47,12 +47,44 @@ fn thinking_on(for_tools: bool) -> bool {
     }
 }
 
+/// Max silence between two upstream chunks (streaming) / total body wait (non-streaming).
+fn read_timeout() -> std::time::Duration {
+    let secs = std::env::var("CIVIL_LLM_READ_TIMEOUT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(180);
+    std::time::Duration::from_secs(secs)
+}
+
 fn http_client() -> Result<reqwest::Client, LlmError> {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(read_timeout())
         .http1_only()
         .build()
         .map_err(|e| LlmError(format!("http client: {e}")))
+}
+
+fn stream_client() -> Result<reqwest::Client, LlmError> {
+    // no total timeout: a long draft may stream for minutes; only silence is a failure
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(read_timeout())
+        .http1_only()
+        .build()
+        .map_err(|e| LlmError(format!("http client: {e}")))
+}
+
+pub const STOPPED: &str = "__stopped__";
+
+impl LlmError {
+    pub fn stopped() -> Self {
+        LlmError(STOPPED.into())
+    }
+    pub fn is_stopped(&self) -> bool {
+        self.0 == STOPPED
+    }
 }
 
 fn http_err(status: reqwest::StatusCode, body: &str) -> LlmError {
@@ -104,12 +136,25 @@ pub async fn chat(messages: &[Value], tools: Option<&[Value]>, temperature: f32)
         .ok_or_else(|| LlmError("LLM 响应缺少 message".into()))
 }
 
-pub async fn stream_plain<F>(messages: &[Value], temperature: f32, mut on_piece: F) -> Result<(), LlmError>
+/// Streaming completion that also assembles tool calls from deltas.
+///
+/// `on_piece` receives content as it arrives; the returned value is shaped like a
+/// non-streaming `choices[0].message` (content + tool_calls) so callers can append it
+/// to history unchanged. `should_stop` is polled per upstream line; when it returns
+/// true the upstream connection is dropped and `LlmError::stopped()` is returned.
+pub async fn stream_chat<F, S>(
+    messages: &[Value],
+    tools: Option<&[Value]>,
+    temperature: f32,
+    mut on_piece: F,
+    should_stop: S,
+) -> Result<Value, LlmError>
 where
     F: FnMut(&str),
+    S: Fn() -> bool,
 {
     let cfg = llm_config();
-    let thinking = llm_uses_thinking(&cfg.base_url) && thinking_on(false);
+    let thinking = llm_uses_thinking(&cfg.base_url) && thinking_on(tools.is_some());
     let mut payload = json!({
         "model": cfg.model,
         "messages": messages,
@@ -120,8 +165,12 @@ where
     } else {
         payload["temperature"] = json!(temperature);
     }
+    if let Some(tools) = tools {
+        payload["tools"] = json!(tools);
+        payload["tool_choice"] = json!("auto");
+    }
     let url = format!("{}/chat/completions", cfg.base_url);
-    let mut r = http_client()?
+    let mut r = stream_client()?
         .post(url)
         .headers(headers()?)
         .json(&payload)
@@ -134,37 +183,91 @@ where
         let body = String::from_utf8_lossy(&raw).into_owned();
         return Err(http_err(status, &body));
     }
-    while let Some(chunk) = r
-        .chunk()
-        .await
-        .map_err(|e| LlmError(format!("stream chunk: {e}")))?
-    {
-        let text = String::from_utf8_lossy(&chunk);
-        for line in text.split('\n') {
+    let mut content = String::new();
+    let mut calls: std::collections::BTreeMap<usize, Value> = std::collections::BTreeMap::new();
+    let mut finish = String::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut done = false;
+    while !done {
+        let Some(chunk) = r
+            .chunk()
+            .await
+            .map_err(|e| LlmError(format!("stream chunk: {e}")))?
+        else {
+            break;
+        };
+        if should_stop() {
+            return Err(LlmError::stopped());
+        }
+        buf.extend_from_slice(&chunk);
+        // SSE lines can straddle network chunks: only consume complete lines
+        while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line);
             let line = line.trim();
-            if line.is_empty() {
+            let Some(data) = line.strip_prefix("data:") else {
                 continue;
-            }
-            let data = line.strip_prefix("data: ").unwrap_or("");
+            };
+            let data = data.trim();
             if data.is_empty() {
                 continue;
             }
-            if data.trim() == "[DONE]" {
-                return Ok(());
+            if data == "[DONE]" {
+                done = true;
+                break;
             }
-            if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                if let Some(piece) = chunk
-                    .pointer("/choices/0/delta/content")
-                    .and_then(|v| v.as_str())
-                {
-                    if !piece.is_empty() {
-                        on_piece(piece);
+            let Ok(ev) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let Some(choice) = ev.pointer("/choices/0") else {
+                continue;
+            };
+            if let Some(f) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                finish = f.to_string();
+            }
+            let delta = choice.get("delta").cloned().unwrap_or(json!({}));
+            if let Some(piece) = delta.get("content").and_then(|v| v.as_str()) {
+                if !piece.is_empty() {
+                    content.push_str(piece);
+                    on_piece(piece);
+                }
+            }
+            for tc in delta.get("tool_calls").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let slot = calls.entry(idx).or_insert_with(|| {
+                    json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                });
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    slot["id"] = json!(id);
+                }
+                if let Some(f) = tc.get("function") {
+                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                        let cur = slot["function"]["name"].as_str().unwrap_or("").to_string();
+                        slot["function"]["name"] = json!(format!("{cur}{n}"));
+                    }
+                    if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
+                        let cur = slot["function"]["arguments"].as_str().unwrap_or("").to_string();
+                        slot["function"]["arguments"] = json!(format!("{cur}{a}"));
                     }
                 }
             }
         }
     }
-    Ok(())
+    let mut msg = json!({"role": "assistant", "content": content});
+    if !calls.is_empty() {
+        msg["tool_calls"] = json!(calls.into_values().collect::<Vec<_>>());
+    }
+    if !finish.is_empty() {
+        msg["finish_reason"] = json!(finish);
+    }
+    Ok(msg)
+}
+
+pub async fn stream_plain<F>(messages: &[Value], temperature: f32, on_piece: F) -> Result<(), LlmError>
+where
+    F: FnMut(&str),
+{
+    stream_chat(messages, None, temperature, on_piece, || false).await.map(|_| ())
 }
 
 #[cfg(test)]

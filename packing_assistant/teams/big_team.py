@@ -304,6 +304,7 @@ def iter_big_team_run(
         t0 = time.perf_counter()
         err: Optional[str] = None
         upd: Dict[str, Any] = {}
+        cancelled_inside = False
         try:
             with otel_span(
                 f"agent.{node}",
@@ -314,7 +315,8 @@ def iter_big_team_run(
                     "session_id": sid,
                     "replan_round": int(state.get("replan_round") or 0),
                 },
-            ):
+            ), _cancel.scope(rid, sid):
+                # tools call cancel.check() inside their loops → RunCancelled mid-agent
                 upd = fn(state) or {}
             _merge_update(upd)
             if node == "present_team_a" and enable_auto_confirm:
@@ -326,11 +328,19 @@ def iter_big_team_run(
                     container_type=state.get("container_type") or container_type,
                     max_containers=int(state.get("max_containers") or max_containers or 0),
                 )
+        except _cancel.RunCancelled as e:
+            cancelled_inside = True
+            err = str(e)
+            state["phase"] = "cancelled"
+            state["cancelled"] = True
+            state.setdefault("errors", []).append(f"{node}: {e}")
         except Exception as e:
             err = str(e)
             state.setdefault("errors", []).append(f"{node}: {e}")
         ms = int((time.perf_counter() - t0) * 1000)
         step = _build_step(node, title, upd, ms, err, team=team)
+        if cancelled_inside:
+            step["status"] = "cancelled"
         steps.append(step)
         state["agent_steps"] = list(state.get("agent_steps") or []) + [step]
         # tool 事件（供 smoke / 观测）

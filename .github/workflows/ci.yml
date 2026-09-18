@@ -25,6 +25,19 @@ jobs:
         run: |
           pip install -r demo/requirements.txt pytest
           python -m pytest -q demo/tests
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Front-end flow (phone viewport, jsdom) + HTTP stream checks against the Python workbench
+        run: |
+          cd scripts/e2e && npm ci --no-audit --no-fund
+          (npm run fake-llm > /tmp/fake_llm.log 2>&1 &)
+          (cd ../../demo && CIVIL_API_KEY=test CIVIL_API_BASE=http://127.0.0.1:9999/v1 CIVIL_MODEL=fake CIVIL_SSE_PING_SEC=1 python serve.py > /tmp/wb.log 2>&1 &)
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8765/api/health > /dev/null && break; sleep 1; done
+          npm test
+          npm run stream-checks
+      - name: Cooperative cancel inside a packing agent
+        run: python scripts/test_cancel_inside_agent.py
       - name: Frontend static checks
         run: |
           python - <<'PY'
@@ -113,3 +126,26 @@ jobs:
           else
             echo "skip t80 materials not in repo"
           fi
+
+  rust-workbench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: cargo test (unit + MCP + 106 API integration tests)
+        run: cargo test --release --manifest-path workbench/Cargo.toml
+      - name: Same phone-viewport flow + stream checks against the Rust workbench
+        run: |
+          pip install fastapi "uvicorn[standard]" httpx
+          cd scripts/e2e && npm ci --no-audit --no-fund
+          (npm run fake-llm > /tmp/fake_llm.log 2>&1 &)
+          (CIVIL_API_KEY=test CIVIL_API_BASE=http://127.0.0.1:9999/v1 CIVIL_MODEL=fake CIVIL_SSE_PING_SEC=1 CIVIL_PORT=8766 ../../workbench/target/release/civil-workbench > /tmp/rs.log 2>&1 &)
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8766/api/health > /dev/null && break; sleep 1; done
+          npm run test:rust
+          python3 stream_checks.py http://127.0.0.1:8766

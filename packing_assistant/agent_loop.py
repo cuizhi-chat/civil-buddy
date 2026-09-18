@@ -573,6 +573,9 @@ def iter_llm_agent_loop(
     last_tool = ""
     critic_count = 0
     for rnd in range(max_rounds):
+        from packing_assistant.runtime import cancel as _cancel
+
+        _cancel.check()
         action = _ask_llm(state, history) if use_llm else None
         if not action:
             action = _fallback_policy(

@@ -245,6 +245,7 @@ async fn test_chat_plain_when_no_explicit_summon() {
             text: "PLAIN".into(),
         },
         force_has_key: Some(true),
+        auth_token: None,
     };
     let (code, body) = send(
         st,
@@ -4126,4 +4127,219 @@ async fn test_harness_tender_question_no_write() {
         .join("bid-parse")
         .join("招标解析表.md")
         .is_file());
+}
+
+// ---------- v0.7: threads / config / auth / downloads (parity with demo/tests/test_stream_resilience.py) ----------
+
+fn fake_state(text: &str) -> AppState {
+    AppState {
+        paths: paths(),
+        llm: LlmMode::FakePlain { text: text.into() },
+        force_has_key: Some(true),
+        auth_token: None,
+    }
+}
+
+fn post_json(uri: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn sse_events(body: &str) -> Vec<(String, Value)> {
+    body.split("\n\n")
+        .filter(|b| !b.trim().is_empty() && !b.trim_start().starts_with(':'))
+        .filter_map(|block| {
+            let mut name = "message".to_string();
+            let mut data = None;
+            for line in block.lines() {
+                if let Some(n) = line.strip_prefix("event: ") {
+                    name = n.trim().to_string();
+                } else if let Some(d) = line.strip_prefix("data: ") {
+                    data = serde_json::from_str::<Value>(d).ok();
+                }
+            }
+            data.map(|d| (name, d))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_health_capabilities_declare_threads_and_config() {
+    let (st, body) = send(state(), Request::builder().uri("/api/health").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let caps = &v["capabilities"];
+    assert_eq!(caps["backend"], "rust");
+    for k in ["upload", "threads", "thread_messages", "thread_files", "cancel", "config", "heartbeat", "file_events"] {
+        assert_eq!(caps[k], true, "{k}");
+    }
+}
+
+#[tokio::test]
+async fn test_config_get_and_set_modes() {
+    let (st, body) = send(state(), Request::builder().uri("/api/config").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ok"], true);
+    assert!(v["sandbox_modes"].as_array().unwrap().len() == 2);
+    assert_eq!(v["confirm_sentence"], "我明白，将由持证人员签认");
+    let (st, _) = send(state(), post_json("/api/config", json!({"sandbox": "nope"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, body) = send(state(), post_json("/api/config", json!({"approval": "never"}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["approval"], "never");
+    std::env::set_var("CIVIL_APPROVAL", "on-request");
+}
+
+#[tokio::test]
+async fn test_chat_creates_thread_and_transcript() {
+    let (code, body) = send(
+        fake_state("临边防护三米"),
+        post_json("/api/chat", json!({"message": "什么是临边", "expert_ids": []})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let evs = sse_events(&body);
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.first().copied(), Some("context"), "{names:?}");
+    assert!(names.contains(&"token") && names.last().copied() == Some("done"), "{names:?}");
+    let ctx = &evs[0].1;
+    let tid = ctx["thread_id"].as_str().expect("thread_id in context").to_string();
+    assert!(ctx["session_id"].as_str().is_some());
+
+    let (st, body) = send(state(), Request::builder().uri(format!("/api/threads/{tid}/messages")).body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let msgs = v["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{v}");
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[1]["content"], "临边防护三米");
+    assert_eq!(v["state"], "done");
+
+    // second turn on the same thread keeps the transcript growing
+    let (code, body) = send(
+        fake_state("再说一次"),
+        post_json("/api/chat", json!({"message": "再来", "expert_ids": [], "thread_id": tid})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(sse_events(&body)[0].1["thread_id"], tid);
+    let (_, body) = send(state(), Request::builder().uri(format!("/api/threads/{tid}/messages")).body(Body::empty()).unwrap()).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["messages"].as_array().unwrap().len(), 4);
+
+    let (st, _) = send(state(), Request::builder().uri(format!("/api/threads/{tid}/files")).body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = send(state(), Request::builder().method("DELETE").uri(format!("/api/threads/{tid}")).body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = send(state(), Request::builder().uri(format!("/api/threads/{tid}")).body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_threads_create_list_cancel() {
+    let (st, body) = send(state(), post_json("/api/threads", json!({"title": "新对话"}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let tid = v["thread_id"].as_str().unwrap().to_string();
+    let (st, body) = send(state(), Request::builder().uri("/api/threads").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["threads"].as_array().unwrap().iter().any(|t| t["thread_id"] == tid));
+    let (st, body) = send(state(), post_json(&format!("/api/threads/{tid}/cancel"), json!({}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["state"], "cancelled");
+    let (st, _) = send(state(), post_json("/api/threads/nope/cancel", json!({}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let _ = send(state(), Request::builder().method("DELETE").uri(format!("/api/threads/{tid}")).body(Body::empty()).unwrap()).await;
+}
+
+#[tokio::test]
+async fn test_background_thread_turn_records_reply() {
+    let (st, body) = send(
+        fake_state("后台答复"),
+        post_json("/api/threads", json!({"text": "什么是 GST", "background": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let tid = v["thread_id"].as_str().unwrap().to_string();
+    assert_eq!(v["state"], "running");
+    let mut state_seen = String::new();
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, body) = send(state(), Request::builder().uri(format!("/api/threads/{tid}")).body(Body::empty()).unwrap()).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        state_seen = v["state"].as_str().unwrap_or("").to_string();
+        if state_seen == "done" {
+            assert_eq!(v["last_reply"], "后台答复");
+            break;
+        }
+    }
+    assert_eq!(state_seen, "done");
+    let _ = send(state(), Request::builder().method("DELETE").uri(format!("/api/threads/{tid}")).body(Body::empty()).unwrap()).await;
+}
+
+#[tokio::test]
+async fn test_download_headers_rfc5987_and_inline() {
+    let p = paths();
+    let dir = p.out_root.join("dltest-rs").join("construction");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("专项方案-AI草稿.md");
+    std::fs::write(&f, "# 草稿\n").unwrap();
+    let res = app(state())
+        .oneshot(Request::builder().uri(format!("/api/file?path={}", urlenc(&f.to_string_lossy()))).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let cd = res.headers().get("content-disposition").unwrap().to_str().unwrap().to_string();
+    assert!(cd.starts_with("attachment"), "{cd}");
+    assert!(cd.contains("filename*=UTF-8''%E4%B8%93"), "{cd}");
+    let res = app(state())
+        .oneshot(Request::builder().uri("/api/file?path=dltest-rs/construction/%E4%B8%93%E9%A1%B9%E6%96%B9%E6%A1%88-AI%E8%8D%89%E7%A8%BF.md&inline=1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().get("content-type").unwrap().to_str().unwrap().starts_with("text/plain"));
+    assert!(res.headers().get("content-disposition").unwrap().to_str().unwrap().starts_with("inline"));
+    let (st, _) = send(state(), Request::builder().uri("/api/file?path=../../README.md").body(Body::empty()).unwrap()).await;
+    assert_ne!(st, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(p.out_root.join("dltest-rs"));
+}
+
+fn urlenc(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_token_gate_when_civil_token_set() {
+    let gated = || AppState { auth_token: Some("s3cret".into()), ..state() };
+    let (st, _) = send(gated(), Request::builder().uri("/api/catalog").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = send(gated(), Request::builder().uri("/").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK, "page must load so it can ask for the token");
+    let (st, body) = send(gated(), Request::builder().uri("/api/health").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK, "health is open (tells the page auth is on)");
+    assert!(body.contains("\"auth\":true"), "{body}");
+    let (st, _) = send(gated(), Request::builder().uri("/api/catalog").header("cookie", "cb_token=s3cret").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = send(gated(), Request::builder().uri("/api/catalog").header("authorization", "Bearer s3cret").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = send(gated(), Request::builder().uri("/api/catalog?token=wrong").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = send(state(), Request::builder().uri("/api/catalog").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK, "no token configured = open");
 }

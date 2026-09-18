@@ -53,6 +53,9 @@ async function boot() {
     addStatus(`工作台不可达：${e.message || e}`);
   }
   state.caps = health.capabilities || legacyCaps(health);
+  if (state.caps.auth && !document.cookie.includes(`${TOKEN_COOKIE}=`)) {
+    await askToken("这个工作台开了访问口令");
+  }
   const badge = $("keyBadge");
   if (health.has_key || health.deepseek) {
     badge.textContent = "已配置 API Key";
@@ -109,14 +112,43 @@ function show(el, on) {
 
 // ---------- http ----------
 
+// Optional shared secret (CIVIL_TOKEN on the server). Kept in a cookie so plain download
+// links and XHR uploads carry it too; asked for once, on the first 401.
+const TOKEN_COOKIE = "cb_token";
+let tokenPromptOpen = false;
+
+function setToken(tok) {
+  const v = encodeURIComponent((tok || "").trim());
+  document.cookie = `${TOKEN_COOKIE}=${v}; path=/; max-age=${60 * 60 * 24 * 30}; SameSite=Lax`;
+}
+
+async function askToken(reason) {
+  if (tokenPromptOpen) return false;
+  tokenPromptOpen = true;
+  try {
+    const tok = window.prompt(`${reason || "这个工作台需要访问口令"}（CIVIL_TOKEN）`);
+    if (!tok) return false;
+    setToken(tok);
+    return true;
+  } finally {
+    tokenPromptOpen = false;
+  }
+}
+
+async function fetchApi(url, init, retry = true) {
+  const r = await fetch(url, init);
+  if (r.status === 401 && retry && (await askToken("口令缺失或不对"))) return fetchApi(url, init, false);
+  return r;
+}
+
 async function getJson(url) {
-  const r = await fetch(url);
+  const r = await fetchApi(url);
   if (!r.ok) throw new Error(await apiError(r));
   return r.json();
 }
 
 async function postJson(url, body, method = "POST") {
-  const r = await fetch(url, {
+  const r = await fetchApi(url, {
     method,
     headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -684,7 +716,7 @@ function onStreamBroken(bodyEl, err) {
 
 async function streamChat(message, bodyEl) {
   const s = state.stream;
-  const res = await fetch("/api/chat", {
+  const res = await fetchApi("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     signal: s && s.ctrl ? s.ctrl.signal : undefined,
@@ -924,6 +956,7 @@ function uploadOne(file) {
           const j = JSON.parse(xhr.responseText);
           if (typeof j.detail === "string") msg = j.detail;
         } catch (e) {}
+        if (xhr.status === 401) askToken("上传需要口令，填好后再传一次");
         reject(new Error(msg));
       }
     };

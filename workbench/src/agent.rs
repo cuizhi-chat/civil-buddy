@@ -7,6 +7,8 @@ use crate::packs::{self, ToolCtx};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const READ_ONLY_TOOLS: &[&str] = &[
     "search_kb",
@@ -531,17 +533,55 @@ pub enum LlmMode {
 
 pub type EventOut = (String, Value);
 
-pub async fn run_plain(history: Vec<Value>, mode: &LlmMode) -> Result<Vec<EventOut>, LlmError> {
-    let mut events = vec![(
+/// Live delivery of events while a run is in progress.
+///
+/// `sink` forwards every event the moment it is produced (the SSE handler drains it);
+/// `stop` is raised when the client went away or pressed 停止. Functions still return
+/// the full `Vec<EventOut>` so tests and offline callers keep working unchanged.
+#[derive(Clone, Default)]
+pub struct Live {
+    pub sink: Option<tokio::sync::mpsc::UnboundedSender<EventOut>>,
+    pub stop: Option<Arc<AtomicBool>>,
+}
+
+impl Live {
+    pub fn none() -> Self {
+        Self::default()
+    }
+    pub fn stopped(&self) -> bool {
+        self.stop.as_ref().map(|s| s.load(Ordering::Relaxed)).unwrap_or(false)
+    }
+}
+
+fn emit(events: &mut Vec<EventOut>, live: &Live, ev: EventOut) {
+    if let Some(tx) = &live.sink {
+        let _ = tx.send(ev.clone());
+    }
+    events.push(ev);
+}
+
+fn emit_all(events: &mut Vec<EventOut>, live: &Live, evs: Vec<EventOut>) {
+    for ev in evs {
+        emit(events, live, ev);
+    }
+}
+
+fn stopped_status() -> EventOut {
+    ("status".into(), json!({"phase": "stopped", "text": "已按要求停止"}))
+}
+
+pub async fn run_plain(history: Vec<Value>, mode: &LlmMode, live: &Live) -> Result<Vec<EventOut>, LlmError> {
+    let mut events = Vec::new();
+    emit(&mut events, live, (
         "status".into(),
         json!({"phase": "plain", "text": "未召唤专家 · 普通 DeepSeek"}),
-    )];
+    ));
     match mode {
         LlmMode::FakePlain { text } => {
             let ctx = context::inspect(&history, &[plain_system(), text]);
-            events.push(("context".into(), ctx.to_value()));
-            events.push(("token".into(), json!({"text": text})));
-            events.push((
+            emit(&mut events, live, ("context".into(), ctx.to_value()));
+            emit(&mut events, live, ("token".into(), json!({"text": text})));
+            emit(&mut events, live, (
                 "done".into(),
                 json!({"mode": "plain", "text": text, "citations": [], "deliverables": [], "context": ctx.to_value()}),
             ));
@@ -550,16 +590,31 @@ pub async fn run_plain(history: Vec<Value>, mode: &LlmMode) -> Result<Vec<EventO
             let mut messages = vec![json!({"role": "system", "content": plain_system()})];
             messages.extend(history);
             let mut buf = String::new();
-            llm::stream_plain(&messages, 0.6, |piece| {
-                buf.push_str(piece);
-                events.push(("token".into(), json!({"text": piece})));
-            })
-            .await?;
+            let mut stopped = false;
+            let res = llm::stream_chat(
+                &messages,
+                None,
+                0.6,
+                |piece| {
+                    buf.push_str(piece);
+                    emit(&mut events, live, ("token".into(), json!({"text": piece})));
+                },
+                || live.stopped(),
+            )
+            .await;
+            match res {
+                Ok(_) => {}
+                Err(e) if e.is_stopped() => {
+                    stopped = true;
+                    emit(&mut events, live, stopped_status());
+                }
+                Err(e) => return Err(e),
+            }
             let ctx = context::inspect(&messages, &[&buf]);
-            events.push(("context".into(), ctx.to_value()));
-            events.push((
+            emit(&mut events, live, ("context".into(), ctx.to_value()));
+            emit(&mut events, live, (
                 "done".into(),
-                json!({"mode": "plain", "text": buf, "citations": [], "deliverables": [], "context": ctx.to_value()}),
+                json!({"mode": "plain", "text": buf, "citations": [], "deliverables": [], "context": ctx.to_value(), "stopped": stopped}),
             ));
         }
     }
@@ -573,21 +628,23 @@ pub async fn run_expert(
     confirm_ok: bool,
     session_id: &str,
     mode: &LlmMode,
+    live: &Live,
 ) -> Result<Vec<EventOut>, LlmError> {
-    let mut events = vec![(
+    let mut events = Vec::new();
+    emit(&mut events, live, (
         "status".into(),
         json!({
             "phase": "summon",
             "text": format!("已召唤 {} / {} · 独立收工", expert.category_name, expert.name),
             "expert": expert.id,
         }),
-    )];
+    ));
 
     if let LlmMode::FakePlain { text } = mode {
         let ctx = context::inspect(&history, &[text]);
-        events.push(("context".into(), ctx.to_value()));
-        events.push(("token".into(), json!({"text": text})));
-        events.push((
+        emit(&mut events, live, ("context".into(), ctx.to_value()));
+        emit(&mut events, live, ("token".into(), json!({"text": text})));
+        emit(&mut events, live, (
             "done".into(),
             json!({
                 "mode": "expert",
@@ -603,7 +660,7 @@ pub async fn run_expert(
 
     let blob = user_blob(&history);
     let intent = understand(&blob);
-    events.push((
+    emit(&mut events, live, (
         "status".into(),
         json!({
             "phase": "understand",
@@ -615,8 +672,8 @@ pub async fn run_expert(
     match intent {
         Intent::Chat => {
             if let Some(text) = offline_explain(paths, &blob) {
-                events.push(("token".into(), json!({"text": text})));
-                events.push((
+                emit(&mut events, live, ("token".into(), json!({"text": text})));
+                emit(&mut events, live, (
                     "done".into(),
                     json!({
                         "mode": "expert",
@@ -629,21 +686,37 @@ pub async fn run_expert(
                     }),
                 ));
             } else {
-                events.extend(
-                    run_expert_explain(paths, expert, history, confirm_ok, session_id).await?,
-                );
+                let evs = run_expert_explain(paths, expert, history, confirm_ok, session_id, live).await?;
+                events.extend(evs); // already forwarded live inside
             }
         }
         Intent::Run | Intent::Both => {
             let ticket = ticket_from_chat(session_id, expert, &history, confirm_ok);
             let run = harness::run_expert_steps(paths, expert, ticket);
-            events.extend(events_from_run(&expert.name, &expert.id, &run));
-            match talk_after_run(paths, expert, &history, confirm_ok, session_id, &run).await {
-                Ok(talk) => events.extend(talk),
+            emit_all(&mut events, live, events_from_run(&expert.name, &expert.id, &run));
+            if !run.files.is_empty() {
+                // surface the drafts now: if the narration below fails, the links are already out
+                emit(&mut events, live, ("file".into(), json!({"deliverables": run.files.clone()})));
+            }
+            if live.stopped() {
+                emit(&mut events, live, stopped_status());
+                let mut done = done_from_run(&expert.name, &expert.id, &run);
+                done.1["stopped"] = json!(true);
+                emit(&mut events, live, done);
+                return Ok(events);
+            }
+            match talk_after_run(paths, expert, &history, confirm_ok, session_id, &run, live).await {
+                Ok(talk) => events.extend(talk), // already forwarded live inside
+                Err(e) if e.is_stopped() => {
+                    emit(&mut events, live, stopped_status());
+                    let mut done = done_from_run(&expert.name, &expert.id, &run);
+                    done.1["stopped"] = json!(true);
+                    emit(&mut events, live, done);
+                }
                 Err(_) => {
                     let text = format_run_text(&expert.name, &run);
-                    events.push(("token".into(), json!({"text": text})));
-                    events.push(done_from_run(&expert.name, &expert.id, &run));
+                    emit(&mut events, live, ("token".into(), json!({"text": text})));
+                    emit(&mut events, live, done_from_run(&expert.name, &expert.id, &run));
                 }
             }
         }
@@ -657,6 +730,7 @@ async fn run_expert_explain(
     history: Vec<Value>,
     confirm_ok: bool,
     session_id: &str,
+    live: &Live,
 ) -> Result<Vec<EventOut>, LlmError> {
     let mut events = Vec::new();
     let mut ctx = ToolCtx::new(
@@ -674,7 +748,7 @@ async fn run_expert_explain(
         .collect();
     let mut messages = vec![json!({"role": "system", "content": build_expert_prompt(expert, confirm_ok)})];
     messages.extend(history);
-    events.push((
+    emit(&mut events, live, (
         "status".into(),
         json!({
             "phase": "chat",
@@ -682,23 +756,43 @@ async fn run_expert_explain(
             "expert": expert.id,
         }),
     ));
-    events.push((
+    emit(&mut events, live, (
         "context".into(),
         context::inspect(&messages, &[]).to_value(),
     ));
 
     let max_steps = max_agent_steps();
     let mut final_text = String::new();
+    let mut streamed = false;
     for step in 0..max_steps {
-        events.push((
+        if live.stopped() {
+            return Err(LlmError::stopped());
+        }
+        emit(&mut events, live, (
             "status".into(),
             json!({"phase": "think", "text": format!("{} 解释 {}/{}", expert.name, step + 1, max_steps)}),
         ));
-        let msg = llm::chat(&messages, Some(&tools), 0.3).await?;
+        let mut got_text = false;
+        let msg = llm::stream_chat(
+            &messages,
+            Some(&tools),
+            0.3,
+            |piece| {
+                got_text = true;
+                emit(&mut events, live, ("token".into(), json!({"text": piece})));
+            },
+            || live.stopped(),
+        )
+        .await?;
         let tool_calls = msg.get("tool_calls").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         if tool_calls.is_empty() {
             final_text = msg.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            streamed = got_text;
             break;
+        }
+        if got_text {
+            // interim "thinking" text was shown; tools come next, so clear the bubble
+            emit(&mut events, live, ("reset".into(), json!({"reason": "tools"})));
         }
         messages.push(msg);
         for call in tool_calls {
@@ -722,7 +816,7 @@ async fn run_expert_explain(
                 .or_else(|| args.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            events.push((
+            emit(&mut events, live, (
                 "status".into(),
                 json!({"phase": name, "text": format!("{} · {} {}", expert.name, name, hint)}),
             ));
@@ -738,10 +832,10 @@ async fn run_expert_explain(
     if final_text.is_empty() {
         final_text = "（达到步数上限，请把任务拆小或再发一次）".into();
     }
-
-    for chunk in final_text.as_bytes().chunks(40) {
-        let text = String::from_utf8_lossy(chunk).to_string();
-        events.push(("token".into(), json!({"text": text})));
+    if !streamed {
+        // nothing came through the stream (fallback text): show it in one piece, never split UTF-8 bytes
+        emit(&mut events, live, ("reset".into(), json!({"reason": "final"})));
+        emit(&mut events, live, ("token".into(), json!({"text": final_text})));
     }
 
     let mut uniq = Vec::new();
@@ -755,8 +849,8 @@ async fn run_expert_explain(
     }
 
     let ctx_end = context::inspect(&messages, &[&final_text]);
-    events.push(("context".into(), ctx_end.to_value()));
-    events.push((
+    emit(&mut events, live, ("context".into(), ctx_end.to_value()));
+    emit(&mut events, live, (
         "done".into(),
         json!({
             "mode": "expert",
@@ -796,6 +890,7 @@ async fn talk_after_run(
     confirm_ok: bool,
     session_id: &str,
     run: &Run,
+    live: &Live,
 ) -> Result<Vec<EventOut>, LlmError> {
     let grounding = read_run_grounding(run);
     let extra = format!(
@@ -816,14 +911,15 @@ async fn talk_after_run(
         .filter(|t| READ_ONLY_TOOLS.contains(&t.name))
         .map(|t| t.openai_tool())
         .collect();
-    let mut events = vec![(
+    let mut events = Vec::new();
+    emit(&mut events, live, (
         "status".into(),
         json!({
             "phase": "talk",
             "text": format!("{} · 出稿后用白话说明", expert.name),
             "expert": expert.id,
         }),
-    )];
+    ));
     let mut ctx = ToolCtx::new(
         paths.clone(),
         &expert.id,
@@ -834,12 +930,27 @@ async fn talk_after_run(
     );
     let max_steps = max_agent_steps();
     let mut final_text = String::new();
+    let mut streamed = false;
     for step in 0..max_steps {
-        events.push((
+        if live.stopped() {
+            return Err(LlmError::stopped());
+        }
+        emit(&mut events, live, (
             "status".into(),
             json!({"phase": "think", "text": format!("{} 说明 {}/{}", expert.name, step + 1, max_steps)}),
         ));
-        let msg = llm::chat(&messages, Some(&tools), 0.3).await?;
+        let mut got_text = false;
+        let msg = llm::stream_chat(
+            &messages,
+            Some(&tools),
+            0.3,
+            |piece| {
+                got_text = true;
+                emit(&mut events, live, ("token".into(), json!({"text": piece})));
+            },
+            || live.stopped(),
+        )
+        .await?;
         let tool_calls = msg
             .get("tool_calls")
             .and_then(|v| v.as_array())
@@ -851,7 +962,11 @@ async fn talk_after_run(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            streamed = got_text;
             break;
+        }
+        if got_text {
+            emit(&mut events, live, ("reset".into(), json!({"reason": "tools"})));
         }
         messages.push(msg);
         for call in tool_calls {
@@ -879,7 +994,7 @@ async fn talk_after_run(
                 .or_else(|| args.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            events.push((
+            emit(&mut events, live, (
                 "status".into(),
                 json!({"phase": name, "text": format!("{} · {} {}", expert.name, name, hint)}),
             ));
@@ -894,11 +1009,15 @@ async fn talk_after_run(
     }
     if final_text.trim().is_empty() {
         final_text = grounding;
+        streamed = false;
     }
-    events.push(("token".into(), json!({"text": final_text})));
+    if !streamed {
+        emit(&mut events, live, ("reset".into(), json!({"reason": "final"})));
+        emit(&mut events, live, ("token".into(), json!({"text": final_text})));
+    }
     let ctx_end = context::inspect(&messages, &[&final_text]);
-    events.push(("context".into(), ctx_end.to_value()));
-    events.push((
+    emit(&mut events, live, ("context".into(), ctx_end.to_value()));
+    emit(&mut events, live, (
         "done".into(),
         json!({
             "mode": "expert",

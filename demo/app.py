@@ -34,6 +34,33 @@ app = FastAPI(title="Civil Buddy Workbench")
 STATIC = DEMO_ROOT / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
+
+def auth_token() -> str:
+    """Shared secret for /api/* when the workbench is bound to a LAN address (CIVIL_TOKEN). Empty = open."""
+    return (os.environ.get("CIVIL_TOKEN") or "").strip()
+
+
+def _token_presented(request: Request) -> str:
+    auth = request.headers.get("authorization") or ""
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    q = request.query_params.get("token")
+    if q:
+        return q
+    return (request.cookies.get("cb_token") or "").strip()
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    expected = auth_token()
+    path = request.url.path
+    # "/" and /static stay open so the page can load and ask for the token; /api/health says auth is on
+    if expected and path.startswith("/api/") and path != "/api/health" and _token_presented(request) != expected:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"detail": "需要访问口令（CIVIL_TOKEN）"}, status_code=401)
+    return await call_next(request)
+
 WORKBENCH_VERSION = "0.7.0"
 # Dedicated pool for chat runs so long expert runs never starve the default sync-endpoint pool.
 _CHAT_POOL = ThreadPoolExecutor(
@@ -55,6 +82,10 @@ CAPABILITIES = {
     "heartbeat": True,
     "file_events": True,
 }
+
+
+def capabilities() -> dict:
+    return {**CAPABILITIES, "auth": bool(auth_token())}
 
 
 class ChatIn(BaseModel):
@@ -109,7 +140,7 @@ def health() -> dict:
         "product_name": "Civil Buddy",
         "tagline": "土木版 Codex",
         "version": WORKBENCH_VERSION,
-        "capabilities": CAPABILITIES,
+        "capabilities": capabilities(),
         "has_key": has_key(),
         "deepseek": has_key(),
         "model": llm_model(),

@@ -111,8 +111,9 @@ python scripts/run_hard_fail_cases.py --smoke
 | `PACKING_AGENT_URL` | 装箱网关（可选） |
 | `PACKING_AGENT_ROOT` | 默认本仓根，一般不用设 |
 | `CIVIL_PORT` | 工作台端口，默认 8765 |
-| `CIVIL_HOST` | 工作台绑定地址，默认 `127.0.0.1`；`0.0.0.0` 开给同网段手机（无鉴权，仅可信内网） |
-| `CIVIL_SSE_PING_SEC` / `CIVIL_LLM_READ_TIMEOUT` / `CIVIL_MAX_CHATS` | SSE 心跳间隔 / 上游读超时 / 并发对话数（Python 工作台） |
+| `CIVIL_HOST` | 工作台绑定地址，默认 `127.0.0.1`；`0.0.0.0` 开给同网段手机（配合 `CIVIL_TOKEN`） |
+| `CIVIL_TOKEN` | 设了就要求 `/api/*` 带口令（Bearer / `?token=` / cookie），Python 与 Rust 工作台一致 |
+| `CIVIL_SSE_PING_SEC` / `CIVIL_LLM_READ_TIMEOUT` / `CIVIL_MAX_CHATS` | SSE 心跳间隔 / 上游读超时（两端）/ 并发对话数（Python） |
 
 ---
 

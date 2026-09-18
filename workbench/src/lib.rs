@@ -16,6 +16,7 @@ pub mod parse;
 pub mod packs;
 pub mod rag;
 pub mod store;
+pub mod threads;
 pub mod tier_map;
 pub mod websearch;
 

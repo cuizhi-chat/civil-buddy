@@ -372,3 +372,19 @@ def test_frontend_guards_secure_context_only_apis():
     # every optional surface is gated on capabilities, not on a 404
     for cap in ("!!c.upload", "!!c.threads", "!!c.firm", "!!c.local", "caps.cancel", "caps.thread_messages", "caps.thread_files"):
         assert cap in js, cap
+
+
+# ---------- optional token gate (CIVIL_TOKEN) ----------
+
+
+def test_token_gate_when_civil_token_set(client, monkeypatch):
+    monkeypatch.setenv("CIVIL_TOKEN", "s3cret")
+    assert client.get("/api/catalog").status_code == 401
+    assert client.get("/").status_code == 200, "page must load so it can ask for the token"
+    h = client.get("/api/health")
+    assert h.status_code == 200 and h.json()["capabilities"]["auth"] is True
+    assert client.get("/api/catalog", cookies={"cb_token": "s3cret"}).status_code == 200
+    assert client.get("/api/catalog", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    assert client.get("/api/catalog", params={"token": "wrong"}).status_code == 401
+    monkeypatch.delenv("CIVIL_TOKEN")
+    assert client.get("/api/catalog").status_code == 200

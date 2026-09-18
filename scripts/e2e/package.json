@@ -1,0 +1,15 @@
+{
+  "name": "civil-buddy-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Workbench front-end flow checks (mobile viewport) against a live backend, using jsdom instead of a real browser.",
+  "scripts": {
+    "test": "node mobile_flow.mjs http://127.0.0.1:8765",
+    "test:rust": "node mobile_flow.mjs http://127.0.0.1:8766",
+    "fake-llm": "python3 -m uvicorn fake_llm:app --host 127.0.0.1 --port 9999 --log-level warning",
+    "stream-checks": "python3 stream_checks.py http://127.0.0.1:8765"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.0"
+  }
+}
