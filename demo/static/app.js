@@ -315,7 +315,7 @@ async function newThread() {
   $("input").focus();
 }
 
-function pollThread(threadId) {
+function pollThread(threadId, opts = {}) {
   if (state.pollers[threadId]) return;
   state.pollers[threadId] = setInterval(async () => {
     let t;
@@ -338,8 +338,40 @@ function pollThread(threadId) {
     } else if (threadId !== state.threadId) {
       addStatus(`后台对话「${t.title || threadId}」${threadStateLabel(t.state)}，点左侧查看。`);
     }
-  }, 3000);
+  }, opts.fast ? 1500 : 3000);
 }
+
+// Coming back from the lock screen / another app / a network drop: the server may have finished
+// (or failed) a run we stopped seeing. Pull the transcript when it has more than we show.
+let resyncing = false;
+async function resync(reason) {
+  if (resyncing || state.stream || !state.caps.threads || !state.threadId) return;
+  resyncing = true;
+  try {
+    const t = await getJson(`/api/threads/${encodeURIComponent(state.threadId)}`);
+    if (t.state === "running" || t.running) {
+      pollThread(state.threadId, { fast: true });
+      return;
+    }
+    const local = state.history.filter((m) => m.role === "user" || m.role === "assistant").length;
+    if ((t.n_messages || 0) > local || $("log").querySelector(".msg.interrupted")) {
+      await selectThread(t, { quiet: true });
+      addStatus(`已从服务端同步（${reason || "回到页面"}）`);
+    }
+  } catch (e) {
+    /* offline again: try on the next visibility/online event */
+  } finally {
+    resyncing = false;
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resync("回到页面");
+});
+window.addEventListener("online", () => resync("网络恢复"));
+window.addEventListener("pageshow", (ev) => {
+  if (ev.persisted) resync("从后退缓存恢复");
+});
 
 async function runBackground(text) {
   const data = await postJson("/api/threads", { text, background: true, confirm_ok: $("confirmOk").checked });
@@ -668,6 +700,7 @@ $("form").addEventListener("submit", async (ev) => {
     return;
   }
   $("input").value = "";
+  state.lastMessage = message;
   addMsg("user", "你", message);
   state.history.push({ role: "user", content: message });
   paintContext(estimateLocalContext());
@@ -693,6 +726,7 @@ function setStreaming(on, bodyEl) {
 function stopStreaming(reason) {
   const s = state.stream;
   if (!s) return;
+  s.userStopped = true;
   if (s.ctrl) s.ctrl.abort();
   if (state.caps.cancel && state.threadId) {
     postJson(`/api/threads/${encodeURIComponent(state.threadId)}/cancel`, {}).catch(() => {});
@@ -705,12 +739,34 @@ if ($("stop")) $("stop").addEventListener("click", () => stopStreaming("用户�
 function onStreamBroken(bodyEl, err) {
   const s = state.stream;
   const acc = s ? s.acc : "";
-  const aborted = err && (err.name === "AbortError" || /abort/i.test(String(err.message || "")));
+  const userStopped = !!(s && s.userStopped);
   const wrap = bodyEl.parentElement;
+  if (err && err.busy) {
+    // server is still finishing the previous (detached) turn on this thread: keep the message, wait
+    if (wrap) wrap.remove();
+    const mine = [...$("log").querySelectorAll(".msg.user")].pop();
+    if (mine) mine.remove();
+    state.history.pop();
+    $("input").value = state.lastMessage || "";
+    addStatus(`${err.message} 已把这条话放回输入框。`);
+    state.foregroundThread = "";
+    pollThread(state.threadId, { fast: true });
+    return;
+  }
   if (wrap) wrap.classList.add("interrupted");
-  if (!acc) bodyEl.textContent = aborted ? "（已停止）" : `（未收到回复：${err.message || err}）`;
-  else if (!aborted) addStatus(`⚠ 连接中断：${err.message || err}。上面的内容已保留；文件若已落盘，切回本对话即可看到。`);
-  state.history.push({ role: "assistant", content: acc || "（这条回复没有收到）" });
+  if (userStopped) {
+    if (!acc) bodyEl.textContent = "（已停止）";
+  } else {
+    // the socket died under us (lock screen, wifi blip, proxy timeout): the server keeps running
+    // detached and writes the reply into the transcript — follow it and re-render when it lands
+    if (!acc) bodyEl.textContent = "（连接断开，服务端继续生成中…）";
+    addStatus(`⚠ 连接中断：${(err && (err.message || err.name)) || err}。已生成的内容保留；服务端会继续跑完，完成后自动同步到这里。`);
+    if (state.caps.threads && state.threadId) {
+      state.foregroundThread = ""; // let the poller re-render this thread when the run finishes
+      pollThread(state.threadId, { fast: true });
+    }
+  }
+  state.history.push({ role: "assistant", content: acc || (userStopped ? "（已停止）" : "（这条回复没有收到）") });
   paintContext(estimateLocalContext());
 }
 
@@ -730,6 +786,12 @@ async function streamChat(message, bodyEl) {
       attachments: state.attachments.filter((a) => !String(a.id || "").startsWith("job:") && !a.uploading).map((a) => a.id),
     }),
   });
+  if (res.status === 409) {
+    const why = await apiError(res);
+    const e = new Error(why);
+    e.busy = true;
+    throw e;
+  }
   if (!res.ok) throw new Error(await apiError(res));
   if (!res.body) throw new Error("浏览器不支持流式读取");
   const reader = res.body.getReader();
@@ -1092,6 +1154,18 @@ if ($("scrim")) $("scrim").addEventListener("click", closeDrawers);
 window.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") closeDrawers();
 });
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const fit = () => {
+    const layout = document.querySelector(".layout");
+    if (!layout || !isNarrow()) return;
+    layout.style.height = `${Math.round(vv.height - (document.querySelector(".top") || { offsetHeight: 53 }).offsetHeight)}px`;
+    scrollLog(false);
+  };
+  vv.addEventListener("resize", fit);
+  vv.addEventListener("scroll", fit);
+}
+
 window.addEventListener("beforeunload", (ev) => {
   if (state.stream) {
     ev.preventDefault();

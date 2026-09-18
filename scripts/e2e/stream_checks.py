@@ -50,13 +50,31 @@ path=files[0]["path"]
 h=httpx.get(f"{BASE}/api/file", params={"path":path}).headers; print("download CD:", h["content-disposition"])
 h=httpx.get(f"{BASE}/api/file", params={"path":path,"inline":"1"}).headers; print("inline CT:", h["content-type"], "|", h["content-disposition"][:20])
 
-print("\n=== 3) client disconnects mid-stream: worker must stop, upstream must be aborted ===")
+print("\n=== 3) client disconnects mid-stream (lock screen): run finishes detached, transcript gets the reply ===")
 before=httpx.get(f"{FAKE}/state").json()
+n_before=len(httpx.get(f"{BASE}/api/threads/{tid}/messages").json()["messages"])
 fr,aborted=run({"message":"什么是 GST","expert_ids":[],"thread_id":tid}, abort_after=4.0)
 print("client aborted after", fr[-1][0], "s with", len([1 for _,e,_ in fr if e=='token']), "tokens received")
-time.sleep(3.5)
+deadline=time.time()+60; st={}
+while time.time()<deadline:
+    st=httpx.get(f"{BASE}/api/threads/{tid}").json()
+    if st["state"]!="running": break
+    time.sleep(0.5)
+msgs=httpx.get(f"{BASE}/api/threads/{tid}/messages").json()["messages"]
+after=httpx.get(f"{FAKE}/state").json()
+print("thread state:", st["state"], "| upstream aborted:", after["aborted"]-before["aborted"], "| new rows:", len(msgs)-n_before, "| reply len:", len(msgs[-1]["content"]))
+assert st["state"]=="done" and after["aborted"]-before["aborted"]==0, "detached run must finish"
+assert msgs[-1]["role"]=="assistant" and len(msgs[-1]["content"])>=100, "full reply must be in the transcript"
+
+print("\n=== 4) explicit 停止 (POST cancel) is the only thing that aborts the upstream ===")
+before=httpx.get(f"{FAKE}/state").json()
+def cancel_later():
+    time.sleep(3.5); httpx.post(f"{BASE}/api/threads/{tid}/cancel")
+threading.Thread(target=cancel_later).start()
+fr,_=run({"message":"什么是 GST","expert_ids":[],"thread_id":tid})
+done=[d for _,e,d in fr if e=="done"]
 after=httpx.get(f"{FAKE}/state").json()
 st=httpx.get(f"{BASE}/api/threads/{tid}").json()
-print("upstream aborted count:", after["aborted"]-before["aborted"], "| thread state:", st["state"], "| cancel flag cleared:", not st["cancel_requested"])
-assert after["aborted"]-before["aborted"]>=1 and st["state"] in {"cancelled","done"}
+print("done.stopped:", done[0].get("stopped") if done else None, "| upstream aborted:", after["aborted"]-before["aborted"], "| thread state:", st["state"], "| cancel flag cleared:", not st["cancel_requested"])
+assert done and done[0].get("stopped") is True and st["state"]=="cancelled" and after["aborted"]-before["aborted"]>=1
 print("\nALL E2E CHECKS PASSED")

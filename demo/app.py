@@ -81,6 +81,7 @@ CAPABILITIES = {
     "mcp": True,
     "heartbeat": True,
     "file_events": True,
+    "detach": True,  # runs survive a dropped client; page re-syncs from the transcript
 }
 
 
@@ -630,6 +631,11 @@ async def chat(body: ChatIn, request: Request) -> StreamingResponse:
         th = new_thread(body.message[:40] or "新对话", confirm=body.confirm_ok)
     session = th.session_id or body.session_id or uuid.uuid4().hex[:12]
     thread_id = th.thread_id
+    from packing_assistant.runtime.threads import _BOOT
+
+    if th.state == "running" and th.updated_at >= _BOOT:
+        # a detached run (client dropped) is still producing on this thread: let it finish first
+        raise HTTPException(409, "上一条还在生成中（连接断开后服务端继续跑）；稍等，完成后会自动同步。")
     clear_cancel(thread_id)
     ids, skill_source = _resolve_ids(body)
 
@@ -651,6 +657,10 @@ async def chat(body: ChatIn, request: Request) -> StreamingResponse:
     queue: asyncio.Queue = asyncio.Queue()
     stop = threading.Event()
     done_marker = object()
+    # CIVIL_DETACH=continue (default): a client that drops mid-run (phone lock screen, wifi blip) does NOT
+    # cancel the run; it finishes, the transcript gets the reply, and the page re-syncs on return.
+    # CIVIL_DETACH=stop: old behaviour, disconnect == cancel.
+    detach_stop = (os.environ.get("CIVIL_DETACH") or "continue").strip().lower() == "stop"
 
     def should_stop() -> bool:
         return stop.is_set() or cancel_requested(thread_id)
@@ -738,7 +748,9 @@ async def chat(body: ChatIn, request: Request) -> StreamingResponse:
                     break
                 yield _sse(ev)
         finally:
-            stop.set()  # client went away or we finished: the worker stops at its next LLM chunk / step
+            if detach_stop:
+                stop.set()  # client went away: the worker stops at its next LLM chunk / step
+            # otherwise the worker keeps going detached; /api/threads/{id}/cancel is the only way to stop it
 
     return StreamingResponse(
         events(),

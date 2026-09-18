@@ -817,6 +817,7 @@ def _strip_pack_floor(
     # 估列宽：取众数宽度
     widths = []
     for it in work:
+        _cancel.check()
         _, dy, _ = orient_floor(it)
         widths.append(dy)
     col_w = max(widths) if widths else W

@@ -4343,3 +4343,75 @@ async fn test_token_gate_when_civil_token_set() {
     let (st, _) = send(state(), Request::builder().uri("/api/catalog").body(Body::empty()).unwrap()).await;
     assert_eq!(st, StatusCode::OK, "no token configured = open");
 }
+
+#[tokio::test]
+async fn test_skills_catalog_from_agents_dir() {
+    let (st, body) = send(state(), Request::builder().uri("/api/skills").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let rows = v["skills"].as_array().unwrap();
+    assert!(rows.len() >= 60, "{}", rows.len());
+    let c = rows.iter().find(|r| r["name"] == "construction").expect("construction skill");
+    assert!(c["description"].as_str().unwrap().contains("专项方案"), "{c}");
+    assert!(!rows.iter().any(|r| r["name"] == "civil-buddy"));
+}
+
+#[tokio::test]
+async fn test_mcp_http_surface_mirrors_civil_mcp() {
+    let (st, body) = send(state(), Request::builder().uri("/api/mcp/capabilities").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["capabilities"]["tools"].is_object());
+
+    let (st, body) = send(state(), Request::builder().uri("/api/mcp/tools?expert_id=construction").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let names: Vec<&str> = v["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"search_kb"), "{names:?}");
+    assert!(!names.contains(&"extract_tender"), "construction pack must not expose tender tools: {names:?}");
+
+    let (st, body) = send(state(), Request::builder().uri("/api/mcp/resources?expert_id=bid-parse").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let res = v["resources"].as_array().unwrap();
+    assert!(!res.is_empty());
+    let uri = res[0]["uri"].as_str().unwrap().to_string();
+    let (st, body) = send(state(), post_json("/api/mcp/resources/read", json!({"uri": uri, "expert_id": "bid-parse"}))).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ok"], true);
+
+    let (st, _) = send(state(), Request::builder().uri("/api/mcp/prompts?expert_id=construction").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, body) = send(state(), post_json("/api/mcp/tools/call", json!({"name": "search_kb", "expert_id": "construction", "arguments": {"query": "临边"}}))).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["content"].is_array(), "{v}");
+
+    let (st, _) = send(state(), Request::builder().uri("/api/mcp/tools?expert_id=nope").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = send(state(), Request::builder().uri("/api/mcp/resources").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_chat_refuses_while_detached_run_is_still_producing() {
+    use civil_workbench::threads;
+    let p = paths();
+    let th = threads::new_thread(&p, "busy", false).unwrap();
+    threads::mark_running(&th.thread_id, true);
+    let (st, body) = send(
+        fake_state("x"),
+        post_json("/api/chat", json!({"message": "再来一条", "expert_ids": [], "thread_id": th.thread_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    threads::mark_running(&th.thread_id, false);
+    let (st, _) = send(
+        fake_state("x"),
+        post_json("/api/chat", json!({"message": "再来一条", "expert_ids": [], "thread_id": th.thread_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let _ = threads::delete(&p, &th.thread_id);
+}

@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from packing_assistant.runtime import cancel as _cancel
 
 
 def export_shipment_xlsx(
@@ -80,6 +81,7 @@ def export_shipment_xlsx(
     ws2 = wb.create_sheet("POR_by_container")
     ws2.append(["container_no", "box_id", "part_no", "name", "weight_kg"])
     for c in por.get("by_container") or []:
+        _cancel.check()
         cno = c.get("container_no")
         for r in c.get("rows") or []:
             ws2.append(
@@ -98,6 +100,7 @@ def export_shipment_xlsx(
         ["seq", "type", "severity", "container_no", "box_id", "action", "material"]
     )
     for it in swo.get("items") or []:
+        _cancel.check()
         ws3.append(
             [
                 it.get("seq"),

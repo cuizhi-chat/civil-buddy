@@ -388,3 +388,16 @@ def test_token_gate_when_civil_token_set(client, monkeypatch):
     assert client.get("/api/catalog", params={"token": "wrong"}).status_code == 401
     monkeypatch.delenv("CIVIL_TOKEN")
     assert client.get("/api/catalog").status_code == 200
+
+
+def test_chat_refuses_while_detached_run_is_still_producing(client):
+    from packing_assistant.runtime import threads as T
+
+    th = T.new_thread("busy")
+    th.state = "running"
+    T.save_thread(th)  # updated_at >= _BOOT → a live detached run, not a stale one
+    r = client.post("/api/chat", json={"message": "再来一条", "expert_ids": [], "thread_id": th.thread_id})
+    assert r.status_code == 409 and "自动同步" in r.text
+    th.state = "done"
+    T.save_thread(th)
+    assert client.get("/api/health").json()["capabilities"]["detach"] is True

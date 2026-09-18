@@ -116,7 +116,7 @@ async function main() {
   await waitFor(() => !$("send").disabled, { label: "stream finished", timeout: 90000 });
   const bubbles = [...d.querySelectorAll(".msg.assistant .body")];
   const last = bubbles[bubbles.length - 1];
-  check("assistant reply rendered", !!last && text(last).length > 0, text(last).slice(0, 80));
+  check("assistant reply rendered", !!last && text(last).length > 0, text(last).slice(0, 80) + " || LOG: " + text($("log")).slice(-400));
   check("run produced deliverables in the 文件 panel", d.querySelectorAll("#files li").length >= 1, String(d.querySelectorAll("#files li").length));
   const dl = d.querySelector("#files li a.file-act");
   check("download link carries download attr + /api/file", !!dl && dl.hasAttribute("download") && dl.href.includes("/api/file?path="));
@@ -156,6 +156,35 @@ async function main() {
   const st1 = await (await fetch(`${BASE}/api/threads/${tid1}`)).json();
   check("server thread state after stop is cancelled/done (not stuck running)", ["cancelled", "done"].includes(st1.state), st1.state);
 
+  // ---- 锁屏: the OS kills the socket (not the user) → server finishes detached → page re-syncs ----
+  const rowsBefore = (await (await fetch(`${BASE}/api/threads/${tid1}/messages`)).json()).messages.length;
+  $("input").value = "什么是 GST";
+  $("form").dispatchEvent(new w.Event("submit", { cancelable: true }));
+  await waitFor(() => {
+    const b = [...d.querySelectorAll(".msg.assistant .body")].pop();
+    return b && text(b).length >= 2;
+  }, { label: "tokens before lock", timeout: 60000 });
+  const nStatusBefore = d.querySelectorAll(".status-line").length;
+  w.state.stream.ctrl.abort(); // iOS Safari dropping the fetch in the background looks exactly like this
+  await waitFor(() => !$("send").disabled, { label: "stream torn down" });
+  const newStatus = [...d.querySelectorAll(".status-line")].slice(nStatusBefore).map((p) => p.textContent).join(" | ");
+  check("dropped connection is not reported as a user stop", /连接中断/.test(newStatus) && !/已停止（用户/.test(newStatus), newStatus.slice(0, 120));
+  await waitFor(async () => {
+    const t = await (await fetch(`${BASE}/api/threads/${tid1}`)).json();
+    return t.state === "done";
+  }, { label: "detached run finished on the server", timeout: 60000, every: 500 });
+  const rowsAfter = (await (await fetch(`${BASE}/api/threads/${tid1}/messages`)).json()).messages;
+  check("server finished the run and wrote the reply", rowsAfter.length === rowsBefore + 2 && rowsAfter[rowsAfter.length - 1].content.length >= 100);
+  // simulate the phone coming back: visibilitychange → resync (poller may already have re-rendered)
+  Object.defineProperty(d, "visibilityState", { value: "visible", configurable: true });
+  d.dispatchEvent(new w.Event("visibilitychange"));
+  await waitFor(() => {
+    const b = [...d.querySelectorAll(".msg.assistant .body")].pop();
+    return b && text(b).length >= 100 && !b.parentElement.classList.contains("interrupted");
+  }, { label: "re-synced full reply", timeout: 30000, every: 300 });
+  check("full reply shown after coming back, no longer marked interrupted", true);
+  check("history in sync with server transcript", w.state.history.length === rowsAfter.length, `${w.state.history.length} vs ${rowsAfter.length}`);
+
   // ---- thread switch reloads transcript from server ----
   $("btnNewThread").click();
   await waitFor(() => w.state.threadId && w.state.threadId !== tid1, { label: "second thread" });
@@ -166,7 +195,7 @@ async function main() {
   check("first thread listed with state badge", !!row1 && !!row1.querySelector(".tstate"));
   row1.click();
   await waitFor(() => w.state.threadId === tid1 && d.querySelectorAll(".msg.user").length >= 2, { label: "switch back" });
-  check("switching back re-renders the transcript", d.querySelectorAll(".msg.user").length === 2 && w.state.history.length >= 3);
+  check("switching back re-renders the transcript", d.querySelectorAll(".msg.user").length === 3 && w.state.history.length >= 5);
   check("files panel repopulated from server on switch", d.querySelectorAll("#files li").length >= 1);
   check("drawer closed after choosing a thread", !d.querySelector(".rail").classList.contains("open"));
 

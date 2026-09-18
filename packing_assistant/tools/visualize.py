@@ -20,6 +20,7 @@ except Exception:
     pass
 
 from packing_assistant.tools.consolidation import CONTAINER_SPECS
+from packing_assistant.runtime import cancel as _cancel
 
 _COLOR_CYCLE = [
     "#4C78A8",
@@ -75,6 +76,7 @@ def _draw_one_ax(
             pad_ids.add(str(a.get("box_id")))
 
     for i, item in enumerate(items):
+        _cancel.check()
         start = float(item.get("起始位置_m") or item.get("x_m") or 0)
         length = float(item.get("长度_m") or item.get("dx_m") or 0.5)
         box_id = item.get("箱号") or item.get("box_id") or ""
@@ -355,6 +357,7 @@ def draw_layout_multi(
     else:
         axes_list = list(axes.flatten()) if hasattr(axes, "flatten") else [axes]
     for idx, cno in enumerate(sorted(groups.keys())):
+        _cancel.check()  # one 3D/side panel per container can take a second each
         ax = axes_list[idx]
         st = per_stats.get(cno) or {}
         nbox = st.get("boxes") or len(groups[cno])

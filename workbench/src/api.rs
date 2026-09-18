@@ -79,6 +79,14 @@ pub fn app(state: AppState) -> Router {
         .route("/api/harness/trace/{session}/{run_id}", get(harness_trace))
         .route("/api/file", get(file_get))
         .route("/api/config", get(config_get).post(config_set))
+        .route("/api/skills", get(skills_list))
+        .route("/api/mcp/capabilities", get(mcp_capabilities))
+        .route("/api/mcp/resources", get(mcp_resources))
+        .route("/api/mcp/resources/read", post(mcp_resource_read))
+        .route("/api/mcp/prompts", get(mcp_prompts))
+        .route("/api/mcp/prompts/get", post(mcp_prompt_get))
+        .route("/api/mcp/tools", get(mcp_tools))
+        .route("/api/mcp/tools/call", post(mcp_tool_call))
         .route("/api/threads", get(threads_list).post(threads_run))
         .route("/api/threads/{thread_id}", get(thread_one).delete(thread_delete))
         .route("/api/threads/{thread_id}/messages", get(thread_messages))
@@ -170,10 +178,11 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Value> {
             "thread_files": true,
             "cancel": true,
             "config": true,
-            "skills": false,
-            "mcp": false,
+            "skills": true,
+            "mcp": true,
             "heartbeat": true,
             "file_events": true,
+            "detach": true,
             "auth": st.auth_token.is_some(),
         },
         "has_key": keyed,
@@ -631,6 +640,172 @@ struct ChatIn {
     thread_id: String,
 }
 
+// ---------- skills catalog (.agents/skills/<id>/SKILL.md), same rows as packing_assistant/runtime/expert_skills.catalog ----------
+
+fn skill_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && !id.contains("--")
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn frontmatter_field(text: &str, key: &str) -> String {
+    // minimal YAML: top-level `key: value` inside the leading --- block; quotes stripped
+    let Some(rest) = text.strip_prefix("---") else { return String::new() };
+    let Some(end) = rest.find("\n---") else { return String::new() };
+    for line in rest[..end].lines() {
+        if let Some(v) = line.strip_prefix(&format!("{key}:")) {
+            let v = v.trim();
+            let v = v.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(v);
+            let v = v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')).unwrap_or(v);
+            return v.replace("\\\"", "\"");
+        }
+    }
+    String::new()
+}
+
+fn skills_catalog(paths: &Paths) -> Vec<Value> {
+    let dir = paths.repo_root.join(".agents").join("skills");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter(|n| !n.starts_with('.') && n != "civil-buddy" && skill_id_valid(n))
+        .collect();
+    names.sort();
+    let mut rows = Vec::new();
+    for id in names {
+        let p = dir.join(&id).join("SKILL.md");
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let name = frontmatter_field(&text, "name");
+        let desc: String = frontmatter_field(&text, "description").chars().take(500).collect();
+        rows.push(json!({
+            "name": if name.is_empty() { id.clone() } else { name },
+            "description": desc,
+            "path": p.to_string_lossy(),
+        }));
+    }
+    rows
+}
+
+async fn skills_list(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let rows = skills_catalog(&st.paths);
+    Json(json!({"ok": true, "n": rows.len(), "skills": rows, "host": "civil-workbench"}))
+}
+
+// ---------- MCP surface over HTTP: thin wrappers around mcp::handle_rpc (same filter rules as civil-mcp) ----------
+
+fn mcp_filter(st: &AppState, expert_id: &str) -> Result<crate::mcp::McpFilter, ApiError> {
+    let eid = expert_id.trim();
+    if eid.is_empty() {
+        return Ok(crate::mcp::McpFilter { pack: None, expert: None });
+    }
+    if let Some(exp) = store::get_expert(&st.paths, eid) {
+        return Ok(crate::mcp::McpFilter { pack: Some(exp.category), expert: Some(exp.id) });
+    }
+    if crate::packs::valid_pack(eid) {
+        return Ok(crate::mcp::McpFilter { pack: Some(eid.to_string()), expert: None });
+    }
+    Err(err(StatusCode::NOT_FOUND, "unknown expert"))
+}
+
+fn mcp_rpc(st: &AppState, filter: &crate::mcp::McpFilter, method: &str, params: Value) -> Result<Value, ApiError> {
+    let msg = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+    let reply = crate::mcp::handle_rpc(&st.paths, filter, msg).ok_or_else(|| err(StatusCode::BAD_REQUEST, "no reply"))?;
+    if let Some(e) = reply.get("error") {
+        let m = e.get("message").and_then(|v| v.as_str()).unwrap_or("mcp error");
+        return Err(err(StatusCode::BAD_REQUEST, m));
+    }
+    Ok(reply.get("result").cloned().unwrap_or(json!({})))
+}
+
+fn q_expert(q: &HashMap<String, String>) -> String {
+    q.get("expert_id").cloned().unwrap_or_default()
+}
+
+async fn mcp_capabilities(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let filter = crate::mcp::McpFilter { pack: None, expert: None };
+    let r = mcp_rpc(&st, &filter, "initialize", json!({"protocolVersion": "2024-11-05"}))?;
+    Ok(Json(json!({"ok": true, "capabilities": r.get("capabilities").cloned().unwrap_or(json!({})), "serverInfo": r.get("serverInfo").cloned().unwrap_or(json!({}))})))
+}
+
+async fn mcp_resources(State(st): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, ApiError> {
+    let eid = q_expert(&q);
+    if eid.is_empty() {
+        return Err(err(StatusCode::NOT_FOUND, "unknown expert"));
+    }
+    let filter = mcp_filter(&st, &eid)?;
+    let r = mcp_rpc(&st, &filter, "resources/list", json!({}))?;
+    Ok(Json(json!({"ok": true, "resources": r.get("resources").cloned().unwrap_or(json!([]))})))
+}
+
+#[derive(Deserialize)]
+struct McpResourceIn {
+    uri: String,
+    #[serde(default = "default_bid_parse")]
+    expert_id: String,
+}
+
+fn default_bid_parse() -> String {
+    "bid-parse".into()
+}
+
+async fn mcp_resource_read(State(st): State<Arc<AppState>>, Json(body): Json<McpResourceIn>) -> Result<Json<Value>, ApiError> {
+    let filter = mcp_filter(&st, &body.expert_id)?;
+    let mut r = mcp_rpc(&st, &filter, "resources/read", json!({"uri": body.uri}))?;
+    r["ok"] = json!(true);
+    Ok(Json(r))
+}
+
+async fn mcp_prompts(State(st): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, ApiError> {
+    let filter = mcp_filter(&st, &q_expert(&q))?;
+    let r = mcp_rpc(&st, &filter, "prompts/list", json!({}))?;
+    Ok(Json(json!({"ok": true, "prompts": r.get("prompts").cloned().unwrap_or(json!([]))})))
+}
+
+#[derive(Deserialize)]
+struct McpPromptIn {
+    name: String,
+    #[serde(default = "default_bid_parse")]
+    expert_id: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+async fn mcp_prompt_get(State(st): State<Arc<AppState>>, Json(body): Json<McpPromptIn>) -> Result<Json<Value>, ApiError> {
+    let filter = mcp_filter(&st, &body.expert_id)?;
+    let args = if body.arguments.is_object() { body.arguments } else { json!({}) };
+    let mut r = mcp_rpc(&st, &filter, "prompts/get", json!({"name": body.name, "arguments": args}))?;
+    r["ok"] = json!(true);
+    Ok(Json(r))
+}
+
+async fn mcp_tools(State(st): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, ApiError> {
+    let filter = mcp_filter(&st, &q_expert(&q))?;
+    let r = mcp_rpc(&st, &filter, "tools/list", json!({}))?;
+    Ok(Json(json!({"ok": true, "tools": r.get("tools").cloned().unwrap_or(json!([]))})))
+}
+
+#[derive(Deserialize)]
+struct McpToolIn {
+    name: String,
+    #[serde(default)]
+    expert_id: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+async fn mcp_tool_call(State(st): State<Arc<AppState>>, Json(body): Json<McpToolIn>) -> Result<Json<Value>, ApiError> {
+    let filter = mcp_filter(&st, &body.expert_id)?;
+    let args = if body.arguments.is_object() { body.arguments } else { json!({}) };
+    let mut r = mcp_rpc(&st, &filter, "tools/call", json!({"name": body.name, "arguments": args}))?;
+    r["ok"] = json!(true);
+    Ok(Json(r))
+}
+
 // ---------- config (sandbox / approval), same modes as packing_assistant/runtime/civil_config.py ----------
 
 const SANDBOX_MODES: &[&str] = &["read-only", "workspace-write"];
@@ -905,6 +1080,10 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatIn>) -> Resu
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?,
     };
     let thread_id = th.thread_id.clone();
+    if threads::is_running(&thread_id) {
+        // a detached run (client dropped) is still producing on this thread: let it finish first
+        return Err(err(StatusCode::CONFLICT, "上一条还在生成中（连接断开后服务端继续跑）；稍等，完成后会自动同步。"));
+    }
     let session = if !th.session_id.is_empty() {
         th.session_id.clone()
     } else if !body.session_id.is_empty() {
@@ -977,6 +1156,22 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatIn>) -> Resu
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let live = agent::Live { sink: Some(tx.clone()), stop: Some(stop.clone()) };
     let stop_for_drop = stop.clone();
+    // POST /api/threads/{id}/cancel writes the registry; mirror it into the run's stop flag
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop_w = stop.clone();
+        let fin_w = finished.clone();
+        let tid_w = thread_id.clone();
+        tokio::spawn(async move {
+            while !fin_w.load(std::sync::atomic::Ordering::Relaxed) {
+                if threads::cancel_requested(&tid_w) {
+                    stop_w.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+    }
     let st2 = st.clone();
     let llm = st.llm.clone();
     let confirm_ok = body.confirm_ok;
@@ -1091,6 +1286,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatIn>) -> Resu
         }
         threads::mark_running(&tid2, false);
         threads::clear_cancel(&tid2);
+        finished.store(true, std::sync::atomic::Ordering::Relaxed);
         // dropping `tx` here closes the SSE stream
     });
 
@@ -1115,12 +1311,20 @@ fn sse_ping_interval() -> std::time::Duration {
     std::time::Duration::from_secs_f64(secs)
 }
 
-/// Raises the run's stop flag when the SSE stream is dropped (client disconnected or finished).
+/// Raises the run's stop flag when the SSE stream is dropped — only under CIVIL_DETACH=stop.
+/// Default (`continue`): a client that drops mid-run (phone lock screen, wifi blip) does not cancel the
+/// run; it finishes, the transcript gets the reply, and the page re-syncs on return.
 struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+fn detach_stops_run() -> bool {
+    std::env::var("CIVIL_DETACH").map(|v| v.trim().eq_ignore_ascii_case("stop")).unwrap_or(false)
+}
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        if detach_stops_run() {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

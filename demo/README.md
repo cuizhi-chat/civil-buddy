@@ -20,7 +20,7 @@ python serve.py            # 读 .env 里的 CIVIL_HOST / CIVIL_PORT；等价于
 
 1. `.env` 里加 `CIVIL_HOST=0.0.0.0`，再加 `CIVIL_TOKEN=随便一串`（`/api/local` 能读这台电脑的文件，开给局域网就得有口令）。手机第一次打开会弹一次口令输入，之后存在 cookie 里，下载链接和上传都自动带。
 2. 手机同一 Wi-Fi 打开 `http://<电脑IP>:8765`。≤720 px 时左栏「岗位/对话」和右栏「文件」变成顶栏按钮拉出的抽屉；本机路径一行在手机上隐藏。
-3. 成稿期间锁屏/切后台回来：已生成的正文保留，落盘文件在「文件」抽屉；切回同一对话会从服务端重新拉转写和文件。
+3. 成稿期间锁屏/切后台回来：连接被系统掐掉不会取消生成，服务端继续跑完写进对话，页面回来自动同步（`CIVIL_DETACH=continue`）；只有点「停止」才真正中断。
 
 ### 断流 / 任务切换（v0.7 起）
 
@@ -28,7 +28,7 @@ python serve.py            # 读 .env 里的 CIVIL_HOST / CIVIL_PORT；等价于
 - 工具一落盘立刻推 `file` 事件；`error` 事件带 `partial_text` 与已落盘 `deliverables`，前端不再用错误覆盖正文。
 - 「停止」按钮 / `/stop`：前端 abort，后端在下一个 chunk 关闭上游流；客户端断开同样会停。
 - 每条对话一个 `thread_id`：`GET /api/threads/{id}/messages` 转写、`/files` 该会话所有落盘文件、`POST /cancel`、`DELETE`。刷新页面回到上次对话；「新建」清屏；「并行」任务完成后提示。
-- `/api/health.capabilities` 声明本后端支持什么；共用前端按它隐藏按钮。Rust 工作台同样有 threads/config/cancel（磁盘格式一致，两边看到同一批对话）；Python 没有一人公司成套；`skills`/`mcp` 只在 Python。
+- `/api/health.capabilities` 声明本后端支持什么；共用前端按它隐藏按钮。Rust 工作台同样有 threads/config/cancel/skills/mcp（磁盘格式一致，两边看到同一批对话）；Python 没有一人公司成套。
 - 前端流程验收（手机视口、两套后端同一套 34 项）：`scripts/e2e/README.md`。
 
 ### 上传 / 下载
