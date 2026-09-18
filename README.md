@@ -44,7 +44,7 @@ cd workbench
 cargo run --release --bin civil-workbench
 ```
 
-Python 参考实现：`demo/`（`uvicorn app:app --host 127.0.0.1 --port 8765`）。
+Python 参考实现：`demo/`（`python demo/serve.py`，或 `uvicorn app:app --host 127.0.0.1 --port 8765`）。
 
 产品 CLI（土木版 Codex）：`python -m packing_assistant.civil`（TUI）· `civil app` · `civil mcp --pack construction`。技能一岗一份：`.agents/skills/<id>/SKILL.md`。IDE：`ide/README.md`。Grok 总控：`skills/civil-buddy`。  
 **全量产品规划书**：[docs/civil-buddy/product-plan.md](docs/civil-buddy/product-plan.md)。切片执行：[product-completion-plan.md](docs/civil-buddy/product-completion-plan.md)。
@@ -111,6 +111,8 @@ python scripts/run_hard_fail_cases.py --smoke
 | `PACKING_AGENT_URL` | 装箱网关（可选） |
 | `PACKING_AGENT_ROOT` | 默认本仓根，一般不用设 |
 | `CIVIL_PORT` | 工作台端口，默认 8765 |
+| `CIVIL_HOST` | 工作台绑定地址，默认 `127.0.0.1`；`0.0.0.0` 开给同网段手机（无鉴权，仅可信内网） |
+| `CIVIL_SSE_PING_SEC` / `CIVIL_LLM_READ_TIMEOUT` / `CIVIL_MAX_CHATS` | SSE 心跳间隔 / 上游读超时 / 并发对话数（Python 工作台） |
 
 ---
 

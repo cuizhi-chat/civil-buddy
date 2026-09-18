@@ -109,7 +109,7 @@ def test_invalid_expert_id_rejected(client):
 def test_chat_plain_when_no_explicit_summon(client, monkeypatch):
     monkeypatch.setattr("app.has_key", lambda: True)
 
-    def fake_plain(history):
+    def fake_plain(history, **_kw):
         yield {"event": "done", "data": {"mode": "plain", "text": "PLAIN", "citations": [], "deliverables": []}}
 
     monkeypatch.setattr("app.run_plain", fake_plain)

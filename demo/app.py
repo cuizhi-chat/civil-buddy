@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import mimetypes
+import os
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -27,6 +34,28 @@ app = FastAPI(title="Civil Buddy Workbench")
 STATIC = DEMO_ROOT / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
+WORKBENCH_VERSION = "0.7.0"
+# Dedicated pool for chat runs so long expert runs never starve the default sync-endpoint pool.
+_CHAT_POOL = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("CIVIL_MAX_CHATS", "8") or 8), thread_name_prefix="civil-chat"
+)
+CAPABILITIES = {
+    "backend": "python",
+    "upload": True,
+    "attachments": True,
+    "local": True,
+    "firm": False,  # 一人公司成套 only ships in the Rust workbench (harness steps)
+    "threads": True,
+    "thread_messages": True,
+    "thread_files": True,
+    "cancel": True,
+    "config": True,
+    "skills": True,
+    "mcp": True,
+    "heartbeat": True,
+    "file_events": True,
+}
+
 
 class ChatIn(BaseModel):
     message: str
@@ -34,6 +63,8 @@ class ChatIn(BaseModel):
     expert_ids: list[str] = Field(default_factory=list)
     confirm_ok: bool = False
     session_id: str = ""
+    thread_id: str = ""
+    attachments: list[str] = Field(default_factory=list)
 
 
 class ExpertIn(BaseModel):
@@ -77,6 +108,8 @@ def health() -> dict:
         "product": "civil-codex",
         "product_name": "Civil Buddy",
         "tagline": "土木版 Codex",
+        "version": WORKBENCH_VERSION,
+        "capabilities": CAPABILITIES,
         "has_key": has_key(),
         "deepseek": has_key(),
         "model": llm_model(),
@@ -270,6 +303,63 @@ def thread_one(thread_id: str) -> dict:
     return got
 
 
+@app.get("/api/threads/{thread_id}/messages")
+def thread_messages(thread_id: str, limit: int = 400) -> dict:
+    from packing_assistant.runtime.threads import load_messages, load_thread
+
+    th = load_thread(thread_id)
+    if not th:
+        raise HTTPException(404, "unknown thread")
+    return {"ok": True, **th.to_dict(), "messages": load_messages(thread_id, limit=max(1, min(limit, 2000)))}
+
+
+def _session_files(session_id: str) -> list[dict[str, Any]]:
+    """Every deliverable written under out/<session>/<expert>/ — survives a broken stream."""
+    from attach import sanitize_session
+
+    try:
+        sid = sanitize_session(session_id)
+    except ValueError:
+        return []
+    root = OUT_ROOT / sid
+    if not root.is_dir():
+        return []
+    rows = []
+    for p in sorted(root.glob("*/*"), key=lambda x: x.stat().st_mtime, reverse=True):
+        if p.is_file():
+            rows.append({"expert": p.parent.name, "name": p.name, "path": str(p), "bytes": p.stat().st_size, "mtime": p.stat().st_mtime})
+    return rows
+
+
+@app.get("/api/threads/{thread_id}/files")
+def thread_files(thread_id: str) -> dict:
+    from packing_assistant.runtime.threads import load_thread
+
+    th = load_thread(thread_id)
+    if not th:
+        raise HTTPException(404, "unknown thread")
+    return {"ok": True, "thread_id": thread_id, "session_id": th.session_id, "files": _session_files(th.session_id)}
+
+
+@app.post("/api/threads/{thread_id}/cancel")
+def thread_cancel(thread_id: str) -> dict:
+    from packing_assistant.runtime.threads import request_cancel
+
+    got = request_cancel(thread_id)
+    if not got.get("ok"):
+        raise HTTPException(404, "unknown thread")
+    return got
+
+
+@app.delete("/api/threads/{thread_id}")
+def thread_delete(thread_id: str) -> dict:
+    from packing_assistant.runtime.threads import delete_thread
+
+    if not delete_thread(thread_id):
+        raise HTTPException(404, "unknown thread")
+    return {"ok": True, "thread_id": thread_id}
+
+
 @app.get("/api/catalog")
 def catalog() -> dict:
     return catalog_payload()
@@ -363,16 +453,62 @@ def studio_limit(body: LimitIn) -> dict:
     return {"kb_soft_limit_kb": set_soft_limit(body.kb_soft_limit_kb), "max_file_bytes": MAX_FILE_BYTES}
 
 
-@app.post("/api/chat")
-def chat(body: ChatIn) -> StreamingResponse:
-    if not has_key():
-        raise HTTPException(
-            400,
-            "未配置 API Key。在 demo/.env 写入 CIVIL_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY。",
-        )
+@app.post("/api/upload")
+async def upload(session_id: str = Form(...), file: list[UploadFile] = File(...)) -> dict:
+    from attach import MAX_BYTES, save_upload
 
-    session = body.session_id or uuid.uuid4().hex[:12]
-    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    if not session_id.strip():
+        raise HTTPException(400, "缺少 session_id")
+    if not file:
+        raise HTTPException(400, "没有收到文件")
+    saved = []
+    errors = []
+    for up in file:
+        data = await up.read(MAX_BYTES + 1)
+        try:
+            saved.append(save_upload(session_id, up.filename or "upload.bin", data))
+        except ValueError as exc:
+            errors.append(f"{up.filename}：{exc}")
+        finally:
+            await up.close()
+    if not saved:
+        raise HTTPException(400, "；".join(errors) or "上传失败")
+    return {"ok": True, "files": saved, "errors": errors}
+
+
+@app.get("/api/attachments")
+def attachments(session_id: str) -> dict:
+    from attach import list_uploads
+
+    if not session_id.strip():
+        raise HTTPException(400, "缺少 session_id")
+    return {"ok": True, "files": list_uploads(session_id)}
+
+
+class LocalIn(BaseModel):
+    session_id: str
+    path: str = ""
+
+
+@app.post("/api/local")
+def local_import(body: LocalIn) -> dict:
+    from attach import import_local
+
+    try:
+        files = import_local(body.session_id, body.path)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    return {"ok": True, "files": files}
+
+
+@app.post("/api/firm/bid")
+def firm_bid_unavailable() -> dict:
+    raise HTTPException(501, "成套投标（一人公司 harness）只在 Rust 工作台里提供；Python 参考实现未移植。")
+
+
+def _resolve_ids(body: ChatIn) -> tuple[list[str], str]:
     skill_source = ""
     ids = [i for i in body.expert_ids if get_expert(i)]
     if ids:
@@ -388,67 +524,225 @@ def chat(body: ChatIn) -> StreamingResponse:
         if hit and get_expert(hit):
             ids = [hit]
             skill_source = "matched"
+    return ids, skill_source
 
+
+def _clean_history(raw: list[dict]) -> list[dict]:
     history = []
-    for item in body.history[-80:]:
+    for item in raw[-80:]:
         role = item.get("role")
         content = item.get("content")
-        if role in {"user", "assistant"} and isinstance(content, str):
+        if role in {"user", "assistant"} and isinstance(content, str) and content:
+            # never send two consecutive user turns (a broken stream leaves one behind)
+            if history and history[-1]["role"] == role == "user":
+                history[-1] = {"role": "user", "content": history[-1]["content"] + "\n" + content}
+                continue
             history.append({"role": role, "content": content})
-    history.append({"role": "user", "content": body.message})
+    return history
+
+
+def _run_events(
+    *,
+    ids: list[str],
+    skill_source: str,
+    history: list[dict],
+    confirm_ok: bool,
+    session: str,
+    should_stop,
+):
+    """Synchronous event producer; runs on _CHAT_POOL."""
+    if not ids:
+        for ev in run_plain(history, should_stop=should_stop):
+            if ev.get("event") == "done" and isinstance(ev.get("data"), dict):
+                ev["data"]["skill"] = ""
+                ev["data"]["skill_source"] = ""
+            yield ev
+        return
+    n = len(ids)
+    for i, eid in enumerate(ids):
+        if should_stop():
+            return
+        exp = get_expert(eid)
+        if not exp:
+            continue
+        if n > 1:
+            yield {"event": "status", "data": {"phase": "queue", "text": f"独立专家 {i + 1}/{n}：{exp.name}"}}
+        for ev in run_expert(exp, history, confirm_ok=confirm_ok, session_id=session, should_stop=should_stop):
+            if ev.get("event") == "done" and isinstance(ev.get("data"), dict):
+                ev["data"]["skill"] = eid
+                ev["data"]["skill_source"] = skill_source or "given"
+            yield ev
+
+
+@app.post("/api/chat")
+async def chat(body: ChatIn, request: Request) -> StreamingResponse:
+    if not has_key():
+        raise HTTPException(
+            400,
+            "未配置 API Key。在 demo/.env 写入 CIVIL_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY。",
+        )
+    from attach import bundle_for_prompt
     from context import prepare_history
+    from packing_assistant.runtime.threads import (
+        append_message,
+        cancel_requested,
+        clear_cancel,
+        load_thread,
+        new_thread,
+        save_thread,
+    )
 
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    # one thread per conversation; the session (= deliverable folder) follows the thread
+    th = load_thread(body.thread_id) if body.thread_id else None
+    if th is None:
+        th = new_thread(body.message[:40] or "新对话", confirm=body.confirm_ok)
+    session = th.session_id or body.session_id or uuid.uuid4().hex[:12]
+    thread_id = th.thread_id
+    clear_cancel(thread_id)
+    ids, skill_source = _resolve_ids(body)
+
+    history = _clean_history(body.history)
+    user_text = bundle_for_prompt(session, body.attachments, body.message) if body.attachments else body.message
+    if history and history[-1]["role"] == "user":
+        history[-1] = {"role": "user", "content": history[-1]["content"] + "\n" + user_text}
+    else:
+        history.append({"role": "user", "content": user_text})
     history, ctx_report = prepare_history(history)
+    ctx_report = {**ctx_report, "thread_id": thread_id, "session_id": session, "experts": ids, "skill_source": skill_source}
 
-    def events():
+    append_message(thread_id, "user", body.message, attachments=list(body.attachments), experts=ids)
+    th.state = "running"
+    th.last_text = body.message
+    save_thread(th)
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    stop = threading.Event()
+    done_marker = object()
+
+    def should_stop() -> bool:
+        return stop.is_set() or cancel_requested(thread_id)
+
+    def push(ev: Any) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, ev)
+
+    def worker() -> None:
+        state = "done"
+        try:
+            for ev in _run_events(
+                ids=ids,
+                skill_source=skill_source,
+                history=history,
+                confirm_ok=body.confirm_ok,
+                session=session,
+                should_stop=should_stop,
+            ):
+                name = ev.get("event")
+                data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+                if name == "done":
+                    text = str(data.get("text") or "")
+                    if text:
+                        append_message(
+                            thread_id,
+                            "assistant",
+                            text,
+                            expert=data.get("expert") or "",
+                            citations=data.get("citations") or [],
+                            deliverables=data.get("deliverables") or [],
+                            stopped=bool(data.get("stopped")),
+                        )
+                    if data.get("stopped"):
+                        state = "cancelled"
+                elif name == "error":
+                    state = "failed"
+                    partial = str(data.get("partial_text") or "")
+                    append_message(
+                        thread_id,
+                        "assistant",
+                        partial or f"（中断：{data.get('text')}）",
+                        expert=data.get("expert") or "",
+                        deliverables=data.get("deliverables") or [],
+                        error=str(data.get("text") or ""),
+                    )
+                push(ev)
+                if stop.is_set():
+                    state = "cancelled"
+                    break
+        except LLMError as exc:
+            state = "failed"
+            push({"event": "error", "data": {"text": str(exc), "recoverable": True}})
+        except Exception as exc:  # noqa: BLE001
+            state = "failed"
+            push({"event": "error", "data": {"text": f"内部错误：{exc}", "recoverable": False}})
+        finally:
+            try:
+                cur = load_thread(thread_id)
+                if cur:
+                    cur.state = state
+                    cur.cancel_requested = False
+                    save_thread(cur)
+            except Exception:  # noqa: BLE001
+                pass
+            clear_cancel(thread_id)
+            push(done_marker)
+
+    _CHAT_POOL.submit(worker)
+    ping_every = float(os.environ.get("CIVIL_SSE_PING_SEC", "15") or 15)
+
+    async def events():
         try:
             yield _sse({"event": "context", "data": ctx_report})
             if ctx_report.get("compressed"):
                 yield _sse({"event": "status", "data": {"phase": "compress", "text": ctx_report.get("note")}})
-            if not ids:
-                gen = run_plain(history)
-                for ev in gen:
-                    if ev.get("event") == "done" and isinstance(ev.get("data"), dict):
-                        ev["data"]["skill"] = ""
-                        ev["data"]["skill_source"] = ""
-                    yield _sse(ev)
-                return
-            n = len(ids)
-            for i, eid in enumerate(ids):
-                exp = get_expert(eid)
-                if not exp:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=ping_every)
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        break
+                    yield ": ping\n\n"  # SSE comment: keeps proxies/mobile radios from dropping the idle socket
                     continue
-                if n > 1:
-                    yield _sse(
-                        {
-                            "event": "status",
-                            "data": {"phase": "queue", "text": f"独立专家 {i + 1}/{n}：{exp.name}"},
-                        }
-                    )
-                for ev in run_expert(exp, history, confirm_ok=body.confirm_ok, session_id=session):
-                    if ev.get("event") == "done" and isinstance(ev.get("data"), dict):
-                        ev["data"]["skill"] = eid
-                        ev["data"]["skill_source"] = skill_source or "given"
-                    yield _sse(ev)
-        except LLMError as exc:
-            yield _sse({"event": "error", "data": {"text": str(exc)}})
-        except Exception as exc:  # noqa: BLE001
-            yield _sse({"event": "error", "data": {"text": f"内部错误：{exc}"}})
+                if ev is done_marker:
+                    break
+                yield _sse(ev)
+        finally:
+            stop.set()  # client went away or we finished: the worker stops at its next LLM chunk / step
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 def _sse(ev: dict) -> str:
     return f"event: {ev['event']}\ndata: {json.dumps(ev['data'], ensure_ascii=False)}\n\n"
 
 
-@app.get("/api/file")
-def file(path: str) -> FileResponse:
-    target = Path(path).resolve()
+_TEXT_INLINE = {".md", ".txt", ".csv", ".json", ".log"}
+
+
+def _resolve_deliverable(path: str) -> Path:
+    raw = Path(path)
+    target = (raw if raw.is_absolute() else OUT_ROOT / raw).resolve()
     try:
         target.relative_to(OUT_ROOT.resolve())
     except ValueError as exc:
         raise HTTPException(403, "not a deliverable") from exc
     if not target.is_file():
         raise HTTPException(404, "missing")
-    return FileResponse(target)
+    return target
+
+
+@app.get("/api/file")
+def file(path: str, inline: bool = False):
+    """Download a deliverable. `inline=1` previews text formats in the browser (phones)."""
+    target = _resolve_deliverable(path)
+    name = target.name
+    if inline and target.suffix.lower() in _TEXT_INLINE:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        return PlainTextResponse(text, headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(name)}"})
+    media = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    # starlette emits RFC 5987 filename*= for non-ASCII names when filename= is given
+    return FileResponse(target, media_type=media, filename=name)

@@ -123,6 +123,9 @@ def iter_big_team_run(
     rid = str(state.get("run_id") or state.get("session_id") or "run")
     sid = str(state.get("session_id") or rid)
     seq = 0
+    from packing_assistant.runtime import cancel as _cancel
+
+    _cancel.clear(rid, sid)  # a new run of this session must not inherit an old cancel request
 
     def emit(ev: Dict[str, Any]) -> Dict[str, Any]:
         nonlocal seq
@@ -262,6 +265,31 @@ def iter_big_team_run(
     def run_one(node: str, title: str, fn: Any, *, team: str = "big"):
         nonlocal prev_node, state
         parent = None if node in ("intent", "orchestrator") else prev_node
+        if _cancel.is_cancelled(rid) or _cancel.is_cancelled(sid):
+            # cooperative cancel: the user asked to stop; skip this and every later agent
+            state["phase"] = "cancelled"
+            state["cancelled"] = True
+            state.setdefault("errors", []).append(f"{node}: cancelled by user")
+            step = _build_step(node, title, {}, 0, "cancelled by user", team=team)
+            step["status"] = "cancelled"
+            steps.append(step)
+            state["agent_steps"] = list(state.get("agent_steps") or []) + [step]
+            yield emit(
+                {
+                    "type": "agent_end",
+                    "node": node,
+                    "title": title,
+                    "team": team,
+                    "status": "cancelled",
+                    "duration_ms": 0,
+                    "parent_node": parent,
+                    "step": step,
+                    "phase": "cancelled",
+                    "run_id": rid,
+                }
+            )
+            prev_node = node
+            return
         yield emit(
             {
                 "type": "agent_start",

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import os
 import tempfile
 from pathlib import Path
 
@@ -32,6 +33,7 @@ def main() -> int:
     text = "交货期 90 个日历天。★深基坑专项须编制，不满足即废标。施工组织设计 25 分。"
     with tempfile.TemporaryDirectory() as td:
         out = Path(td)
+        os.environ["CIVIL_SANDBOX_ROOTS"] = td  # sandbox only allows repo out dirs by default
         refuse = execute_tool(
             "extract_tender",
             {"tender_text": text},

@@ -3,3 +3,6 @@ uvicorn[standard]>=0.27
 httpx>=0.27
 python-dotenv>=1.0
 pydantic>=2.0
+python-multipart>=0.0.9   # /api/upload
+openpyxl>=3.1             # xlsx attachments / 作业根
+pypdf>=4.0                # pdf attachments (text layer only; scans need OCR first)

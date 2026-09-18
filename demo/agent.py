@@ -10,7 +10,7 @@ import sys
 
 from catalog import Expert
 from config import MAX_AGENT_STEPS, OUT_ROOT, REPO_ROOT
-from llm import chat, stream_plain
+from llm import LLMError, LLMStopped, StopFn, chat, stream_chat
 from rag import list_kb, read_kb, search_kb
 
 if str(REPO_ROOT) not in sys.path:
@@ -74,6 +74,22 @@ TOOLS = [
                     "markdown": {"type": "string"},
                 },
                 "required": ["filename", "markdown"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_attachment",
+            "description": "分段读用户本会话上传的附件全文（id 来自用户消息里的【用户上传】或附件列表）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["id"],
             },
         },
     },
@@ -156,8 +172,21 @@ def execute_tool(
     out_dir: Path,
     citations: list[dict[str, Any]],
     deliverables: list[dict[str, str]],
+    session_id: str = "",
 ) -> str:
     """Shipped expert-tool dispatch. Tests call this; the LLM only chooses the name."""
+    if name == "read_attachment":
+        from attach import read_upload
+
+        try:
+            return read_upload(
+                session_id,
+                str(args.get("id") or ""),
+                int(args.get("offset") or 0),
+                int(args.get("limit") or 8000),
+            )
+        except (ValueError, TypeError) as exc:
+            return f"读附件失败：{exc}"
     if name == "extract_tender":
         if expert.id != "bid-parse":
             return "拒绝：extract_tender 是 bid-parse 独有。"
@@ -246,11 +275,14 @@ def execute_tool(
 
         if high_risk_unconfirmed(risk=expert.risk, confirmed=confirm_ok):
             return f"拒绝写盘：高风险稿需要用户确认句「{CONFIRM}」。"
+        body = str(args.get("markdown") or "")
+        if not body.strip():
+            return "拒绝写盘：markdown 为空（多半是参数 JSON 没生成完整）。请重新调用 write_deliverable 并带上完整正文。"
         raw_name = Path(str(args.get("filename") or "draft.md")).name
         if not raw_name.endswith((".md", ".txt")):
             raw_name += ".md"
         path = out_dir / raw_name
-        _safe_write(path, str(args.get("markdown") or ""))
+        _safe_write(path, body)
         item = {"expert": expert.id, "name": raw_name, "path": str(path)}
         deliverables.append(item)
         return f"已写入 {path}"
@@ -309,14 +341,95 @@ def _plain_system() -> str:
     )
 
 
-def run_plain(history: list[dict[str, str]]) -> Iterator[dict[str, Any]]:
+def _last_user(history: list[dict[str, str]]) -> str:
+    for m in reversed(history):
+        if m.get("role") == "user":
+            return str(m.get("content") or "")
+    return ""
+
+
+def _stopped() -> dict[str, Any]:
+    return {"event": "status", "data": {"phase": "stopped", "text": "已按要求停止"}}
+
+
+def _stream_text(messages: list[dict[str, Any]], *, temperature: float, should_stop: StopFn | None) -> Iterator[str]:
+    """Single choke point for every model call in this module (tests patch agent.stream_chat)."""
+    for ev in stream_chat(messages, temperature=temperature, should_stop=should_stop):
+        if ev["type"] == "text":
+            yield ev["text"]
+
+
+def run_plain(history: list[dict[str, str]], should_stop: StopFn | None = None) -> Iterator[dict[str, Any]]:
     messages = [{"role": "system", "content": _plain_system()}, *history]
     yield {"event": "status", "data": {"phase": "plain", "text": "土木版 Codex · 未选用 skill · 路由器"}}
-    buf = []
-    for piece in stream_plain(messages):
-        buf.append(piece)
-        yield {"event": "token", "data": {"text": piece}}
-    yield {"event": "done", "data": {"mode": "plain", "text": "".join(buf), "citations": [], "deliverables": []}}
+    buf: list[str] = []
+    stopped = False
+    try:
+        for piece in _stream_text(messages, temperature=0.6, should_stop=should_stop):
+            buf.append(piece)
+            yield {"event": "token", "data": {"text": piece}}
+    except LLMStopped:
+        stopped = True
+    yield {
+        "event": "done",
+        "data": {"mode": "plain", "text": "".join(buf), "citations": [], "deliverables": [], "stopped": stopped},
+    }
+
+
+def _expert_chat(
+    expert: Expert,
+    history: list[dict[str, str]],
+    *,
+    should_stop: StopFn | None,
+) -> Iterator[dict[str, Any]]:
+    """Question to a summoned expert: real model answer grounded on KB hits (no tools, no writes)."""
+    question = _last_user(history)
+    hits = search_kb(expert.id, expert.category, question)
+    citations = [
+        {"path": h.path, "layer": h.layer, "title": h.title, "snippet": h.snippet} for h in hits[:6]
+    ]
+    context = "\n\n".join(f"[{c['layer']}] {c['path']}\n{c['snippet']}" for c in citations) or "（本岗库没有命中片段）"
+    system = (
+        build_expert_prompt(expert, confirm_ok=False)
+        + "\n\n本轮是提问，不成稿、不写盘。只根据下面的知识片段和硬规则作答；片段没有的就说没有，"
+        "不要编条款号、数字。答完注明依据来自私库/大类库/公司库。\n\n知识片段：\n"
+        + context
+    )
+    messages = [{"role": "system", "content": system}, *history]
+    buf: list[str] = []
+    stopped = False
+    try:
+        for piece in _stream_text(messages, temperature=0.3, should_stop=should_stop):
+            buf.append(piece)
+            yield {"event": "token", "data": {"text": piece}}
+    except LLMStopped:
+        stopped = True
+    except LLMError:
+        # model down: fall back to the offline template so the user still gets something
+        try:
+            from packing_assistant.expert_roster import get_expert as _ge
+            from packing_assistant.expert_turn import explain_expert
+
+            rec = _ge(expert.id)
+            text = explain_expert(rec, question) if rec else ""
+        except Exception:  # noqa: BLE001
+            text = ""
+        if not text:
+            raise
+        buf = [text]
+        yield {"event": "token", "data": {"text": text}}
+    yield {
+        "event": "done",
+        "data": {
+            "mode": "expert",
+            "expert": expert.id,
+            "intent": "chat",
+            "text": "".join(buf),
+            "citations": citations,
+            "deliverables": [],
+            "stopped": stopped,
+        },
+    }
 
 
 def run_expert(
@@ -325,6 +438,7 @@ def run_expert(
     *,
     confirm_ok: bool,
     session_id: str,
+    should_stop: StopFn | None = None,
 ) -> Iterator[dict[str, Any]]:
     yield {
         "event": "status",
@@ -334,11 +448,12 @@ def run_expert(
             "expert": expert.id,
         },
     }
-    blob = "\n".join(str(m.get("content") or "") for m in history if m.get("role") == "user")
+    # Classify the *latest* user message (same rule as workbench/src/agent.rs), not the whole history.
+    last = _last_user(history)
     try:
         from packing_assistant.understand import understand
 
-        intent = understand(blob)
+        intent = understand(last)
     except Exception:
         intent = "run"
     yield {
@@ -351,29 +466,9 @@ def run_expert(
         },
     }
     if intent == "chat":
-        try:
-            from packing_assistant.expert_roster import get_expert as _ge
-            from packing_assistant.expert_turn import explain_expert
+        yield from _expert_chat(expert, history, should_stop=should_stop)
+        return
 
-            rec = _ge(expert.id)
-            if rec:
-                text = explain_expert(rec, blob)
-                for i in range(0, len(text), 40):
-                    yield {"event": "token", "data": {"text": text[i : i + 40]}}
-                yield {
-                    "event": "done",
-                    "data": {
-                        "mode": "expert",
-                        "expert": expert.id,
-                        "intent": "chat",
-                        "text": text,
-                        "citations": [],
-                        "deliverables": [],
-                    },
-                }
-                return
-        except Exception:
-            pass
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _system(expert, confirm_ok)},
         *history,
@@ -395,53 +490,106 @@ def run_expert(
             out_dir=out_dir,
             citations=citations,
             deliverables=deliverables,
+            session_id=session_id,
         )
 
-    final_text = ""
-    expert_tools = tools_for_expert(expert)
-    for step in range(MAX_AGENT_STEPS):
-        yield {"event": "status", "data": {"phase": "think", "text": f"{expert.name} 步骤 {step + 1}/{MAX_AGENT_STEPS}"}}
-        msg = chat(messages, tools=expert_tools)
-        tool_calls = msg.get("tool_calls") or []
-        if not tool_calls:
-            final_text = msg.get("content") or ""
-            break
-        messages.append(msg)
-        for call in tool_calls:
-            fn = call.get("function") or {}
-            name = fn.get("name") or ""
-            raw = fn.get("arguments") or "{}"
-            try:
-                args = json.loads(raw) if isinstance(raw, str) else (raw or {})
-            except json.JSONDecodeError:
-                args = {}
-            yield {"event": "status", "data": {"phase": name, "text": f"{expert.name} · {name} {args.get('query') or args.get('path') or args.get('filename') or ''}"}}
-            result = _exec(name, args)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.get("id") or name,
-                    "content": result[:12000],
-                }
-            )
-    else:
-        final_text = final_text or "（达到步数上限，请把任务拆小或再发一次）"
+    def _uniq_cites() -> list[dict[str, Any]]:
+        uniq = []
+        seen = set()
+        for c in citations:
+            if c["path"] in seen:
+                continue
+            seen.add(c["path"])
+            uniq.append(c)
+        return uniq
 
-    if not final_text:
+    final_text = ""
+    streamed = ""
+    stopped = False
+    expert_tools = tools_for_expert(expert)
+    try:
+        for step in range(MAX_AGENT_STEPS):
+            if should_stop and should_stop():
+                stopped = True
+                break
+            yield {"event": "status", "data": {"phase": "think", "text": f"{expert.name} 步骤 {step + 1}/{MAX_AGENT_STEPS}"}}
+            msg: dict[str, Any] | None = None
+            streamed = ""
+            for ev in stream_chat(messages, tools=expert_tools, should_stop=should_stop):
+                if ev["type"] == "text":
+                    streamed += ev["text"]
+                    yield {"event": "token", "data": {"text": ev["text"]}}
+                else:
+                    msg = ev["message"]
+            if msg is None:
+                break
+            tool_calls = msg.get("tool_calls") or []
+            if not tool_calls:
+                final_text = msg.get("content") or streamed
+                break
+            if streamed:
+                # interim "thinking" text was shown; tools come next, so clear the bubble
+                yield {"event": "reset", "data": {"reason": "tools"}}
+            messages.append({k: v for k, v in msg.items() if k != "finish_reason"})
+            for call in tool_calls:
+                fn = call.get("function") or {}
+                name = fn.get("name") or ""
+                raw = fn.get("arguments") or "{}"
+                bad_json = False
+                try:
+                    args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                except json.JSONDecodeError:
+                    args, bad_json = {}, True
+                yield {
+                    "event": "status",
+                    "data": {
+                        "phase": name,
+                        "text": f"{expert.name} · {name} {args.get('query') or args.get('path') or args.get('filename') or args.get('id') or ''}",
+                    },
+                }
+                if bad_json:
+                    result = f"工具 {name} 的参数不是合法 JSON（可能被截断）。请缩短单次输出或分段重发。"
+                else:
+                    n_before = len(deliverables)
+                    result = _exec(name, args)
+                    if len(deliverables) > n_before:
+                        # surface files the moment they land, so a later timeout cannot hide them
+                        yield {"event": "file", "data": {"deliverables": deliverables[n_before:]}}
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or name,
+                        "content": result[:12000],
+                    }
+                )
+        else:
+            final_text = final_text or "（达到步数上限，请把任务拆小或再发一次）"
+    except LLMStopped:
+        stopped = True
+    except LLMError as exc:
+        yield {
+            "event": "error",
+            "data": {
+                "text": str(exc),
+                "partial_text": streamed,
+                "expert": expert.id,
+                "citations": _uniq_cites(),
+                "deliverables": deliverables,
+                "recoverable": True,
+            },
+        }
+        return
+
+    if stopped:
+        yield _stopped()
+        final_text = streamed
+    elif not final_text:
         final_text = "已完成检索，但模型没有返回正文。请再试一次。"
 
-    # stream the final as tokens for the same UI
-    for i in range(0, len(final_text), 40):
-        yield {"event": "token", "data": {"text": final_text[i : i + 40]}}
-
-    # unique citations
-    uniq = []
-    seen = set()
-    for c in citations:
-        if c["path"] in seen:
-            continue
-        seen.add(c["path"])
-        uniq.append(c)
+    if final_text and final_text != streamed:
+        # final text came back without streaming (rare: non-stream gateways) — show it in one go
+        yield {"event": "reset", "data": {"reason": "final"}}
+        yield {"event": "token", "data": {"text": final_text}}
 
     yield {
         "event": "done",
@@ -449,8 +597,9 @@ def run_expert(
             "mode": "expert",
             "expert": expert.id,
             "text": final_text,
-            "citations": uniq,
+            "citations": _uniq_cites(),
             "deliverables": deliverables,
+            "stopped": stopped,
             "stamp": datetime.now().strftime("%Y-%m-%dT%H-%M-%S"),
         },
     }

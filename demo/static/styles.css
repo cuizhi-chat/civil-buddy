@@ -47,7 +47,14 @@ html, body {
   display: grid;
   grid-template-columns: 240px 1fr 260px;
   height: calc(100% - 53px);
+  height: calc(100dvh - 53px);
 }
+.hidden { display: none !important; }
+.nav-btn { display: none; }
+.scrim {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.35); z-index: 14; display: none;
+}
+.scrim.on { display: block; }
 .rail {
   background: var(--rail);
   color: var(--rail-ink);
@@ -72,6 +79,14 @@ html, body {
   font-size: 12px; border-radius: 6px;
 }
 .thread-row:hover, .thread-row.on { background: #1c1e24; }
+.thread-row { display: flex; gap: 6px; align-items: center; }
+.thread-row .ttitle { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tstate {
+  flex: none; font-size: 10px; padding: 0 5px; border-radius: 4px; border: 1px solid #3f3f46; color: #a8a29e;
+}
+.tstate.running { color: #5eead4; border-color: #134e4a; }
+.tstate.failed, .tstate.stale { color: #fca5a5; border-color: #7f1d1d; }
+.tstate.done { color: #86efac; border-color: #14532d; }
 .skill-q {
   width: 100%; margin-bottom: 8px; padding: 7px 8px; border-radius: 8px;
   border: 1px solid #3f3f46; background: #1c1e24; color: #e7e5e4; font: inherit; font-size: 12px;
@@ -113,6 +128,8 @@ html, body {
 }
 .msg.assistant { padding: 2px 0; white-space: pre-wrap; }
 .msg .who { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.msg.interrupted .body { border-left: 3px solid var(--warn); padding-left: 10px; }
+.msg.interrupted .who::after { content: " · 中断"; color: var(--warn); }
 .status-line { font-size: 12px; color: var(--accent-2); margin: 0 0 8px; }
 .composer {
   border-top: 1px solid var(--line); padding: 12px 20px 16px; background: var(--panel);
@@ -146,6 +163,17 @@ html, body {
   background: var(--accent); color: #fff; border-color: var(--accent);
   padding: 8px 16px; font-size: 14px; font-weight: 600;
 }
+.send-row { display: flex; gap: 6px; align-items: center; }
+.stop {
+  background: #fff; color: #b91c1c; border: 1px solid #fca5a5; padding: 8px 12px; font-size: 13px;
+  border-radius: 8px; cursor: pointer; font: inherit;
+}
+.chip.uploading { border-style: dashed; color: var(--muted); }
+.side li { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.side li > span:first-child { flex: 1 1 100%; word-break: break-all; }
+.file-act { color: var(--accent-2); font-weight: 600; text-decoration: none; }
+.file-act:hover { text-decoration: underline; }
+.muted-inline { font-weight: 400; color: #a3a3a3; letter-spacing: 0; }
 .side { overflow: auto; padding: 16px 14px 24px; background: #fafafa; border-left: 1px solid var(--line); }
 .side h2 { font-size: 12px; margin: 16px 0 6px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
 .side h2:first-child { margin-top: 0; }
@@ -201,9 +229,32 @@ html, body {
 }
 @media (max-width: 1100px) {
   .layout { grid-template-columns: 200px 1fr; }
-  .side { display: none; }
+  #navFiles { display: inline-block; }
+  .side {
+    position: fixed; top: 53px; right: 0; bottom: 0; width: min(88vw, 340px); z-index: 15;
+    transform: translateX(100%); transition: transform .18s ease-out; box-shadow: -4px 0 16px rgba(0,0,0,.12);
+  }
+  .side.open { transform: none; }
 }
 @media (max-width: 720px) {
   .layout { grid-template-columns: 1fr; }
-  .rail { display: none; }
+  #navExperts, #navThreads { display: inline-block; }
+  .top { padding: 8px 10px; }
+  .brand small { display: none; }
+  .top-meta { gap: 4px; }
+  .top-btn { padding: 6px 8px; font-size: 12px; }
+  .rail {
+    position: fixed; top: 53px; left: 0; bottom: 0; width: min(88vw, 320px); z-index: 15;
+    transform: translateX(-100%); transition: transform .18s ease-out; box-shadow: 4px 0 16px rgba(0,0,0,.25);
+  }
+  .rail.open { transform: none; }
+  .log { padding: 12px 12px 8px; }
+  .msg { max-width: 100%; }
+  .composer { padding: 8px 10px calc(10px + env(safe-area-inset-bottom)); }
+  .composer textarea { font-size: 16px; }   /* stops iOS zoom-on-focus */
+  .local-row { display: none; }             /* server-side paths make no sense on a phone */
+  .hints button { padding: 6px 8px; }
+  .confirm { font-size: 13px; }
+  .studio-grid { grid-template-columns: 1fr; grid-template-rows: 40vh 1fr; }
+  .studio-nav { border-right: 0; border-bottom: 1px solid var(--line); }
 }

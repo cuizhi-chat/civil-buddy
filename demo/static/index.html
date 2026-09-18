@@ -4,7 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Civil Buddy</title>
-  <link rel="stylesheet" href="/static/styles.css?v=ui3" />
+  <meta name="theme-color" content="#0f766e" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui4" />
 </head>
 <body>
   <header class="top">
@@ -21,9 +22,13 @@
       <span class="pill quiet" id="harnessBadge">Harness steps</span>
       <span class="pill quiet" id="sandboxBadge">sandbox</span>
       <span class="pill quiet" id="approvalBadge">approval</span>
+      <button type="button" id="navExperts" class="top-btn nav-btn" aria-controls="wall">岗位</button>
+      <button type="button" id="navThreads" class="top-btn nav-btn" aria-controls="threadList">对话</button>
+      <button type="button" id="navFiles" class="top-btn nav-btn" aria-controls="files">文件</button>
       <button type="button" id="openStudio" class="top-btn">知识库</button>
     </div>
   </header>
+  <div id="scrim" class="scrim" aria-hidden="true"></div>
 
   <main class="layout">
     <aside class="rail">
@@ -57,7 +62,7 @@
         </label>
         <textarea id="input" rows="3" placeholder="输入任务，例如：写临边专项方案讨论提纲"></textarea>
         <div class="local-row">
-          <input id="localPath" type="text" placeholder="本机文件路径（不要填 D:\layout）" />
+          <input id="localPath" type="text" placeholder="工作台电脑上的文件路径（不要填 D:\layout）" />
           <button type="button" id="btnLocal">导入</button>
           <button type="button" id="btnFirm">成套投标</button>
         </div>
@@ -72,7 +77,10 @@
             <button type="button" data-fill="把临边防护编成工友班前三分钟白话。">白话</button>
             <button type="button" data-fill="从下面这段招标里抽出评分点和必须编制的专项：某市政人行道维修，要求编制高处作业/临边专项方案，技术标 40 分。">招标</button>
           </div>
-          <button type="submit" id="send">发送</button>
+          <div class="send-row">
+            <button type="button" id="stop" class="stop hidden">停止</button>
+            <button type="submit" id="send">发送</button>
+          </div>
         </div>
       </form>
     </section>
@@ -80,7 +88,7 @@
     <aside class="side">
       <h2>依据</h2>
       <ul id="cites"></ul>
-      <h2>文件</h2>
+      <h2>文件 <small class="muted-inline">下载 / 预览 · 断流后切回本对话仍可见</small></h2>
       <ul id="files"></ul>
       <h2>本岗库</h2>
       <ul id="kblist"></ul>
@@ -142,7 +150,7 @@
       </div>
     </div>
   </div>
-  <script src="/static/app.js?v=ui3"></script>
-  <script src="/static/studio.js?v=ui3"></script>
+  <script src="/static/app.js?v=ui4"></script>
+  <script src="/static/studio.js?v=ui4"></script>
 </body>
 </html>

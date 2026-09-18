@@ -84,7 +84,7 @@ def test_every_expert_private_and_category_shared_nonstub():
         assert ask.is_file(), e.category
 
 
-def test_bid_tools_exclusive_and_shared_parse(tmp_path):
+def test_bid_tools_exclusive_and_shared_parse(tmp_path, monkeypatch):
     parse = _exp("bid-parse")
     tech = _exp("bid-tech")
     comp = _exp("bid-compliance")
@@ -96,6 +96,7 @@ def test_bid_tools_exclusive_and_shared_parse(tmp_path):
     assert "compliance_gaps" in [t["function"]["name"] for t in tools_for_expert(comp)]
 
     text = "交货期 90 个日历天。★深基坑专项须编制，不满足即废标。施工组织设计 25 分。"
+    monkeypatch.setenv("CIVIL_SANDBOX_ROOTS", str(tmp_path))  # sandbox only allows repo out dirs by default
     cites: list = []
     dels: list = []
     refuse = execute_tool(

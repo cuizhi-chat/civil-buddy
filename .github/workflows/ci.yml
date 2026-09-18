@@ -21,6 +21,10 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
       - name: Import package
         run: python -c "from packing_assistant.config import HARNESS_VERSION; from packing_assistant.harness import iter_agent_pipeline; print(HARNESS_VERSION)"
+      - name: Workbench (demo/) tests — stream resilience, threads, upload/download, route parity
+        run: |
+          pip install -r demo/requirements.txt pytest
+          python -m pytest -q demo/tests
       - name: Frontend static checks
         run: |
           python - <<'PY'

@@ -98,6 +98,24 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Value> {
     let keyed = st.has_key();
     Json(json!({
         "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        // The shared frontend hides any button whose capability is missing instead of hitting a 404.
+        "capabilities": {
+            "backend": "rust",
+            "upload": true,
+            "attachments": true,
+            "local": true,
+            "firm": true,
+            "threads": false,
+            "thread_messages": false,
+            "thread_files": false,
+            "cancel": false,
+            "config": false,
+            "skills": false,
+            "mcp": false,
+            "heartbeat": true,
+            "file_events": false,
+        },
         "has_key": keyed,
         "deepseek": keyed,
         "model": llm_model(),
@@ -744,9 +762,42 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatIn>) -> Resu
         .into_response())
 }
 
+fn percent_encode_utf8(name: &str) -> String {
+    // RFC 5987 / 8187: attachment; filename*=UTF-8''%E4%B8%93... — raw UTF-8 in filename= garbles on Safari/iOS
+    let mut out = String::with_capacity(name.len() * 3);
+    for b in name.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn guess_media_type(name: &str) -> &'static str {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "md" => "text/markdown; charset=utf-8",
+        "txt" | "log" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "pdf" => "application/pdf",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        _ => "application/octet-stream",
+    }
+}
+
 async fn file_get(State(st): State<Arc<AppState>>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
     let raw = q.get("path").cloned().unwrap_or_default();
+    let inline = matches!(q.get("inline").map(|s| s.as_str()), Some("1") | Some("true"));
     let target = PathBuf::from(&raw);
+    // relative paths are resolved under out_root so links need not leak absolute server paths
+    let target = if target.is_absolute() { target } else { st.paths.out_root.join(target) };
     let target = target.canonicalize().map_err(|_| err(StatusCode::NOT_FOUND, "missing"))?;
     let root = st
         .paths
@@ -766,12 +817,22 @@ async fn file_get(State(st): State<Arc<AppState>>, Query(q): Query<HashMap<Strin
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("file");
+    let media = guess_media_type(name);
+    let text_like = media.starts_with("text/") || media.starts_with("application/json");
+    let disposition = if inline && text_like { "inline" } else { "attachment" };
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        "application/octet-stream".parse().unwrap(),
-    );
-    if let Ok(v) = format!("attachment; filename=\"{name}\"").parse() {
+    let content_type = if inline && text_like { "text/plain; charset=utf-8" } else { media };
+    headers.insert(axum::http::header::CONTENT_TYPE, content_type.parse().unwrap());
+    let ascii_fallback: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    if let Ok(v) = format!(
+        "{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{}",
+        percent_encode_utf8(name)
+    )
+    .parse()
+    {
         headers.insert(axum::http::header::CONTENT_DISPOSITION, v);
     }
     Ok((headers, bytes).into_response())
